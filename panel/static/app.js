@@ -1,0 +1,1371 @@
+/* dailycheckin-plus 签到管理面板 —— 无框架、无构建步骤的纯前端 */
+(() => {
+  "use strict";
+
+  const API = "/api";
+
+  /* localStorage 在部分浏览器的隐私模式里会直接抛异常（老 Safari 尤其），
+     面板可用性不能押在它身上：读写都包一层，失败就当没有这个存储。 */
+  const lsGet = (k) => { try { return localStorage.getItem(k); } catch (_) { return null; } };
+  const lsSet = (k, v) => { try { localStorage.setItem(k, v); } catch (_) { /* 隐私模式：放弃持久化 */ } };
+
+  const TOKEN = lsGet("panel_token") || "";
+
+  /* 「上次登录到哪一步」的本地提示。只影响首帧先画哪一屏，真正的判定永远以
+     /api/auth/status 为准 —— 它是客户端存的，伪造它只能骗到自己的浏览器。 */
+  const HINT_KEY = "dc_auth_hint";
+  const readHint = () => {
+    try { return JSON.parse(lsGet(HINT_KEY) || "{}") || {}; } catch (_) { return {}; }
+  };
+  const writeHint = (initialized, loggedIn) =>
+    lsSet(HINT_KEY, JSON.stringify({ i: !!initialized, l: !!loggedIn }));
+
+  const SORT_MODES = ["configured", "default", "name", "group"];
+
+  const S = {
+    state: null,
+    auth: null,
+    gateMode: "login",
+    drafts: {},      // 站点 KEY -> 账号数组（前端草稿）
+    checks: {},      // 站点 KEY -> 每账号的本地体检结果
+    base: {},        // 站点 KEY -> 打开/保存时的草稿快照，用来判断「到底改了没」
+    dirty: {},       // 站点 KEY -> 是否有未保存改动
+    dlgKey: null,    // 当前打开的站点配置弹窗（null = 没开）
+    view: lsGet("dc_view") === "list" ? "list" : "card",
+    sort: SORT_MODES.includes(lsGet("dc_sort")) ? lsGet("dc_sort") : "configured",
+    onlyTodo: false,
+    runId: null,
+    pollTimer: null,
+    logTimer: null,
+  };
+
+  const $ = (id) => document.getElementById(id);
+  const esc = (v) =>
+    String(v == null ? "" : v).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+  const STATE = {
+    valid: ["valid", "有效", "有效"],
+    invalid: ["invalid", "失效", "失效"],
+    unknown: ["unknown", "无法判定", "无法判定"],
+    unverified: ["unverified", "未校验", "未校验"],
+  };
+  const SOURCE_TEXT = { api: "依据：登录态接口", run: "依据：签到运行" };
+  const CHEVRON = '<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M6.2 3.6 10.6 8l-4.4 4.4" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+  const STATE_DOT = { valid: "●", invalid: "●", unknown: "●", unverified: "○" };
+
+  /* ---------------- 网络 ---------------- */
+  async function apiRaw(path, options = {}) {
+    const opt = { credentials: "same-origin", headers: { "Content-Type": "application/json" }, ...options };
+    if (TOKEN) opt.headers["X-Panel-Token"] = TOKEN;
+    if (opt.body && typeof opt.body !== "string") opt.body = JSON.stringify(opt.body);
+    const res = await fetch(API + path, opt);
+    let data = null;
+    try { data = await res.json(); } catch (_) { /* 非 JSON 响应直接忽略 */ }
+    return { status: res.status, data };
+  }
+
+  async function api(path, options = {}) {
+    const { status, data } = await apiRaw(path, options);
+    if (status === 401) {
+      const err = new Error((data && data.error) || "需要登录");
+      err.auth = true;
+      throw err;
+    }
+    if (status >= 400) throw new Error((data && data.error) || `请求失败 (HTTP ${status})`);
+    return data;
+  }
+
+  const toast = (() => {
+    const el = $("toast");
+    let timer = null;
+    return (msg, ms = 2600) => {
+      // 原生 <dialog> 打开时，整个页面的内容（包括固定定位的提示）都排在它的下面
+      // —— 弹窗里点「保存」看不到反馈就等于没反应。把提示挪进当前弹窗，它就跟着
+      // 一起进顶层了；弹窗关掉时再搬回 body（见站点弹窗的 close 监听）。
+      const host = document.querySelector("dialog[open]") || document.body;
+      if (el.parentNode !== host) host.appendChild(el);
+      el.textContent = msg;
+      el.classList.add("show");
+      clearTimeout(timer);
+      timer = setTimeout(() => el.classList.remove("show"), ms);
+    };
+  })();
+
+  const fmtTime = (ts) => {
+    if (!ts) return "—";
+    const d = new Date(ts * 1000);
+    const p = (n) => String(n).padStart(2, "0");
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+  };
+  const ago = (ts) => {
+    if (!ts) return "从未";
+    const s = Math.max(0, Date.now() / 1000 - ts);
+    if (s < 60) return "刚刚";
+    if (s < 3600) return `${Math.floor(s / 60)} 分钟前`;
+    if (s < 86400) return `${Math.floor(s / 3600)} 小时前`;
+    return `${Math.floor(s / 86400)} 天前`;
+  };
+  // 运行记录的种类：定时校验也是 verify，但要和「我点的批量校验」区分开
+  const runLabel = (run) =>
+    run.kind === "verify" ? (run.auto ? "定时校验" : "批量校验") : "签到任务";
+
+  /* ======================================================================
+     登录 / 首次设置
+     ====================================================================== */
+  function showGate(mode, tip) {
+    S.gateMode = mode;
+    const setup = mode === "setup";
+    $("gate").classList.remove("hidden");
+    $("gateForm").classList.remove("hidden");   // 初始是「正在连接」态，表单藏着
+    $("app").classList.add("hidden");
+    $("gateTitle").textContent = setup ? "设置后台账号" : "登录后台";
+    $("gateSub").innerHTML = setup
+      ? "第一次使用，先给这个管理后台设置一个账号和密码。<br>以后每次打开都要用它登录，也可以在「设置」里改。"
+      : "请输入后台账号和密码。";
+    $("gatePass2Wrap").classList.toggle("hidden", !setup);
+    $("gatePass").setAttribute("autocomplete", setup ? "new-password" : "current-password");
+    $("gateSubmit").textContent = setup ? "创建并进入" : "登录";
+    $("gateErr").textContent = "";
+    const p = S.auth || {};
+    $("gateTip").textContent =
+      tip || (setup ? `账号 ${p.min_user || 2}-${p.max_user || 32} 个字符，密码至少 ${p.min_pass || 6} 位。` : "");
+    setTimeout(() => $("gateUser").focus(), 60);
+  }
+
+  function hideGate() {
+    $("gate").classList.add("hidden");
+    $("app").classList.remove("hidden");
+  }
+
+  async function gateCheck() {
+    const { status, data } = await apiRaw("/auth/status");
+    if (status !== 200 || !data) {
+      writeHint(true, false);   // 服务连不上：下次进来先画登录屏，别去瞎等
+      return showGate("login", "连不上面板服务，请检查容器是否在运行。");
+    }
+    S.auth = data;
+    // 每次都把结论写回本地：下次打开就能在首帧直接画对，不用等这一轮请求。
+    if (!data.initialized) { writeHint(false, false); return showGate("setup"); }
+    if (!data.logged_in) { writeHint(true, false); return showGate("login"); }
+    writeHint(true, true);
+    hideGate();
+    await loadState();
+  }
+
+  $("gateForm").addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    const setup = S.gateMode === "setup";
+    const user = $("gateUser").value.trim();
+    const pass = $("gatePass").value;
+    const err = $("gateErr");
+    err.textContent = "";
+    if (!user) return (err.textContent = "请填写账号");
+    if (!pass) return (err.textContent = "请填写密码");
+    if (setup && pass !== $("gatePass2").value) return (err.textContent = "两次输入的密码不一致");
+    if (setup && pass.length < ((S.auth && S.auth.min_pass) || 6)) return (err.textContent = `密码至少 ${(S.auth && S.auth.min_pass) || 6} 位`);
+    const btn = $("gateSubmit");
+    const label = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = setup ? "创建中…" : "登录中…";
+    try {
+      const { status, data } = await apiRaw(setup ? "/auth/setup" : "/auth/login", {
+        method: "POST",
+        body: { username: user, password: pass },
+      });
+      if (status !== 200) {
+        err.textContent = (data && data.error) || "操作失败，请重试";
+        return;
+      }
+      hideGate();
+      writeHint(true, true);
+      await loadState();
+      toast(setup ? "后台账号已创建，开始配置你的签到站点吧" : "登录成功", 3200);
+    } catch (e) {
+      err.textContent = e.message;
+    } finally {
+      btn.disabled = false;
+      btn.textContent = label;
+    }
+  });
+
+  async function logout() {
+    await apiRaw("/auth/logout", { method: "POST" });
+    S.state = null;
+    S.drafts = {};
+    S.checks = {};
+    S.base = {};
+    S.dirty = {};
+    closeSite();
+    $("settings").close();
+    const { data } = await apiRaw("/auth/status");
+    if (data) S.auth = data;
+    writeHint(true, false);   // 刚退出：下次进来直接画登录屏，不用先猜
+    showGate("login");
+    toast("已退出登录");
+  }
+
+  /* ======================================================================
+     状态
+     ====================================================================== */
+  async function loadState(silent = false) {
+    let st;
+    try {
+      st = await api("/state");
+    } catch (e) {
+      if (e.auth) return showGate("login");
+      throw e;
+    }
+    S.state = st;
+    currentSites().forEach((site) => {
+      if (!S.dirty[site.key]) {
+        S.drafts[site.key] = site.accounts.map((a) => ({ ...a }));
+        S.checks[site.key] = site.accounts.map((a) => a._check || null);
+        snapshot(site.key);
+      }
+    });
+    buildGroupFilter();
+    render();
+    paintHeader();
+    // 页脚 / 设置页的版本信息：先用 /api/state 里的本地信息画出来（不发网络请求），
+    // 再在后台查一次有没有新版本 —— 引擎接口该快还是快。
+    paintUpdate(st.update);
+    if (!UP.autoTried) {
+      UP.autoTried = true;
+      checkUpdate(false);
+    }
+    if (!silent) toast("已刷新");
+  }
+
+  const currentSites = () => (S.state ? S.state.sites : []);
+
+  function visibleSites() {
+    const q = ($("search").value || "").trim().toLowerCase();
+    const f = $("filter").value;
+    const g = $("groupFilter").value;
+    return sortSites(currentSites().filter((site) => {
+      if (q && !(site.label.toLowerCase().includes(q) || site.key.toLowerCase().includes(q) || (site.group || "").toLowerCase().includes(q))) return false;
+      if (g && g !== "all" && site.group !== g) return false;
+      if (S.onlyTodo && site.configured) return false;
+      const state = (site.status && site.status.state) || "unverified";
+      if (f === "configured") return site.configured;
+      if (f === "unconfigured") return !site.configured;
+      if (f === "valid") return state === "valid";
+      if (f === "invalid") return state === "invalid";
+      if (f === "unverified") return state === "unverified";
+      return true;
+    }));
+  }
+
+  /* 排序。默认「已配置优先」：打开面板先看到自己在用的站点，没配的沉到后面。
+     sort 是稳定排序，所以同一档里仍然保持后端给的目录顺序，不会每次都跳来跳去。 */
+  function sortSites(sites) {
+    const list = sites.slice();
+    const byName = (a, b) => String(a.label || a.key).localeCompare(String(b.label || b.key), "zh-Hans-CN");
+    const byGroup = (a, b) => String(a.group || "其它").localeCompare(String(b.group || "其它"), "zh-Hans-CN");
+    if (S.sort === "name") return list.sort(byName);
+    if (S.sort === "group") return list.sort((a, b) => byGroup(a, b) || byName(a, b));
+    if (S.sort === "default") return list;
+    return list.sort((a, b) => Number(!!b.configured) - Number(!!a.configured));
+  }
+
+  function buildGroupFilter() {
+    const sel = $("groupFilter");
+    const groups = [...new Set(currentSites().map((s) => s.group || "其它"))].sort();
+    const keep = sel.value;
+    sel.innerHTML = `<option value="all">全部分类（${currentSites().length}）</option>` +
+      groups.map((g) => `<option value="${esc(g)}">${esc(g)}</option>`).join("");
+    sel.value = groups.includes(keep) ? keep : "all";
+  }
+
+  /* ======================================================================
+     渲染 —— 卡片 / 列表
+     ====================================================================== */
+  function render() {
+    const sites = visibleSites();
+    const box = $("sites");
+    $("bootHint").classList.add("hidden");   // 首帧的「正在读取站点列表…」用完就撤
+    box.className = S.view === "list" ? "list" : "grid";
+    box.innerHTML = sites.map(S.view === "list" ? siteRow : siteCard).join("");
+    const hint = $("emptyHint");
+    hint.classList.toggle("hidden", sites.length > 0);
+    hint.innerHTML = sites.length
+      ? ""
+      : `<b>没有匹配的站点</b>换个关键词，或把筛选条件放宽一点<br><button class="tiny" style="margin-top:12px" data-action="reset-filter">清空筛选条件</button>`;
+    // 弹窗可能正开着（保存 / 校验过之后会重新拉一次 state），内容要跟着刷新；
+    // 如果这个站点被筛掉了、或者干脆没了，paintSiteDialog 会自己把弹窗关掉。
+    if (S.dlgKey) paintSiteDialog();
+    paintHeader();
+  }
+
+  function paintHeader() {
+    if (!S.state) return;
+    const counts = { valid: 0, invalid: 0, unknown: 0, unverified: 0 };
+    let configured = 0;
+    currentSites().forEach((s) => {
+      const state = (s.status && s.status.state) || "unverified";
+      counts[state] = (counts[state] || 0) + 1;
+      if (s.configured) configured += 1;
+    });
+    $("statValid").textContent = counts.valid;
+    $("statInvalid").textContent = counts.invalid;
+    $("statUnknown").textContent = counts.unknown + counts.unverified;
+    $("statConfigured").textContent = configured;
+    $("statTotal").textContent = currentSites().length;
+    const last = (S.state.runs || [])[0];
+    $("statLastRun").textContent = last ? `上次任务 ${ago(last.started_at)}` : "还没有运行过";
+    paintBrand();
+    document.body.classList.toggle("masked", $("maskCookie").checked);
+  }
+
+  /* 顶栏品牌 + 版本 + 引擎状态。标题取自后端（可用 PANEL_TITLE 改），
+     浏览器标签页标题也跟着走，不然永远是 index.html 里写死的那份。 */
+  function paintBrand() {
+    if (!S.state) return;
+    const panel = S.state.panel || {};
+    const engine = S.state.engine || {};
+    const name = panel.title || "dailycheckin-plus";
+    $("panelTitle").textContent = name;
+    document.title = `${name} · 签到管理面板`;
+    $("panelVersion").textContent = panel.version || "";
+
+    const dot = $("engineDot");
+    const text = $("engineText");
+    if (engine.ok === true) {
+      dot.className = "dot";
+      text.textContent = `引擎正常 · ${engine.message || ""}`;
+    } else if (engine.ok === false) {
+      dot.className = "dot off";
+      text.textContent = "引擎异常";
+    } else {
+      dot.className = "dot idle";
+      text.textContent = "引擎探测中";
+    }
+    text.title = engine.message || "";
+  }
+
+  const statusBadge = (site) => {
+    const state = (site.status && site.status.state) || "unverified";
+    const [cls, text] = STATE[state] || STATE.unverified;
+    return `<span class="badge ${cls}" title="${esc((site.status && site.status.message) || "")}">${text}</span>`;
+  };
+
+  function logoHTML(site, small) {
+    const cls = small ? "logo sm" : "logo";
+    const fallback = `<span class="lb">${esc(site.emoji || "🧩")}</span>`;
+    if (!site.logo) return `<span class="${cls} broken">${fallback}</span>`;
+    return `<span class="${cls}"><img src="${esc(site.logo)}" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.parentNode.classList.add('broken')">${fallback}</span>`;
+  }
+
+  /* 卡片是「一眼看清状态」的瓷砖：点哪儿都开配置弹窗，自己不改高度、不参与布局变化。
+     整张卡可点（不只是标题行），所以给了 role/tabindex，键盘也能进（见 bind()）。 */
+  function siteCard(site) {
+    const accounts = S.drafts[site.key] || [];
+    const state = (site.status && site.status.state) || "unverified";
+    const meta = [];
+    meta.push(accounts.length ? `${accounts.length} 个账号` : "未配置");
+    if (site.status && site.status.checked_at) meta.push(`校验于 ${ago(site.status.checked_at)}`);
+    const src = site.status && SOURCE_TEXT[site.status.source];
+    if (src) meta.push(src);
+    if (site.status && site.status.message) meta.push(truncate(site.status.message, 58));
+    if (S.dirty[site.key]) meta.push("有未保存的改动");
+    // meta 在 CSS 里是固定一行 + 省略号（长度不一会把同排卡片顶得高低不齐），
+    // 所以完整文案挂到 title 上，鼠标停一下能看到被截掉的部分。
+    const metaText = meta.join(" · ");
+
+    return `
+<article class="card" data-state="${state}" data-key="${site.key}" data-action="open" role="button" tabindex="0" title="配置 ${esc(site.label)}">
+  <div class="card-head">
+    ${logoHTML(site, false)}
+    <span class="names"><b>${esc(site.label)}</b><span>${esc(site.key)}</span></span>
+    <span class="spacer"></span>
+    <span class="tag">${esc(site.group || "其它")}</span>
+    ${statusBadge(site)}
+    <span class="chev" aria-hidden="true">${CHEVRON}</span>
+  </div>
+  <div class="card-meta" title="${esc(metaText)}">${esc(metaText)}</div>
+</article>`;
+  }
+
+  function siteRow(site) {
+    const accounts = S.drafts[site.key] || [];
+    const state = (site.status && site.status.state) || "unverified";
+    const link = site.site
+      ? `<a class="ghost tiny" href="${esc(site.site)}" target="_blank" rel="noopener noreferrer" style="color:var(--fg-2);text-decoration:none;font-size:12px">官网</a>`
+      : "";
+    // 整行也能点开配置；行里的「官网」是链接，点击时会被 click 处理器放行（见下）
+    return `
+<article class="row-item" data-state="${state}" data-key="${site.key}" data-action="open" title="配置 ${esc(site.label)}">
+  ${logoHTML(site, true)}
+  <span class="ri-name"><b>${esc(site.label)}</b><span>${esc(site.key)}</span></span>
+  <span class="ri-group"><span class="tag">${esc(site.group || "其它")}</span></span>
+  <span class="ri-state">${statusBadge(site)}</span>
+  <span class="ri-acc"><span class="tag ${accounts.length ? "acc" : ""}">${accounts.length ? accounts.length + " 个账号" : "未配置"}</span></span>
+  <span class="ri-actions">${link}<button class="tiny" data-action="open" data-key="${site.key}">配置</button></span>
+</article>`;
+  }
+
+  /* 弹窗里的内容：怎么拿 cookie + 凭据类型 + 每个账号一块。
+     操作按钮不在这里 —— 它们在弹窗底栏，滚动编辑区时始终可见。 */
+  function dlgBodyHTML(site, accounts) {
+    const blocks = accounts.length
+      ? accounts.map((acc, i) => accountHTML(site, acc, i)).join("")
+      : `<p class="muted" style="font-size:12.5px;margin-bottom:10px">还没有账号，点右下角的「＋ 添加账号」。</p>`;
+    const link = site.site
+      ? `　<a href="${esc(site.site)}" target="_blank" rel="noopener noreferrer">打开官网登录 ↗</a>`
+      : "";
+    // 必填字段只写在账号的字段标签上（那里离输入框最近）；这一行只说「这是个什么凭据」，
+    // 同一个信息出现两次只会让人多读一遍。
+    return `
+  ${site.howto ? `<div class="howto"><b>怎么拿 cookie：</b>${esc(site.howto)}${link}</div>` : ""}
+  <div class="row" style="margin:0 0 6px">
+    <span class="muted" style="font-size:12px">凭据类型：${site.credential === "cookie" ? "Cookie" : "账号 / 表单"}</span>
+    ${site.verify ? "" : `<span class="badge unknown">无在线校验接口</span>`}
+    ${site.known === false ? `<span class="badge unknown" title="上游新加的站点，本项目还没为它单独写元数据：不会提示必填字段、LOGO 退回 emoji，签到与保存都正常">通用配置</span>` : ""}
+  </div>
+  ${blocks}`;
+  }
+
+  function accountHTML(site, account, index) {
+    const check = (S.checks[site.key] || [])[index];
+    const fieldHTML = (f) => {
+      const value = account[f.key] != null ? account[f.key] : f.default != null ? f.default : "";
+      const label = `${esc(f.label)}${f.required ? ' <span class="req">*</span>' : ""}${f.help ? ` <span class="opt">${esc(f.help)}</span>` : ""}`;
+      if (f.type === "bool") {
+        return `<div><label class="switch">${label}<input type="checkbox" data-field="${esc(f.key)}" ${value ? "checked" : ""}></label></div>`;
+      }
+      // 枚举字段（目前只有 NodeSeek 的签到方式）：只给可选值，避免手输拼错后引擎走错分支。
+      // 后端 catalog.coerce_field 还会按同一份 options 再校验一遍。
+      if (f.type === "select" && Array.isArray(f.options) && f.options.length) {
+        const opts = f.options
+          .map((o) => `<option value="${esc(o.value)}"${String(value) === String(o.value) ? " selected" : ""}>${esc(o.label)}</option>`)
+          .join("");
+        return `<div><label>${label}</label><select data-field="${esc(f.key)}">${opts}</select></div>`;
+      }
+      const type = f.type === "secret" ? "password" : "text";
+      return `<div><label>${label}</label><input type="${type}" data-field="${esc(f.key)}" value="${esc(value)}" autocomplete="off"></div>`;
+    };
+
+    const allFields = site.fields || [];
+    // `primary` 的字段是「会影响签到行为的选择」，不是可选调参（比如 NodeSeek 的
+    // 签到方式：随机 / 固定 5）。这类字段必须一眼看见 —— 收进「其它参数」折叠条里，
+    // 用户会以为没得选，然后一直按默认跑。
+    const primaryFields = allFields.filter((f) => f.primary);
+    const primaryBlock = primaryFields.length
+      ? `<div class="grid2 primary-fields">${primaryFields.map(fieldHTML).join("")}</div>`
+      : "";
+    // cookie 站点里剩下的字段才是可选项，收进 <details>；表单类站点的字段**就是**凭据
+    // （账号密码、token…），全部直接摊开，不然新建账号后先看到一片折叠条。
+    const extras =
+      site.credential === "cookie"
+        ? allFields.filter((f) => !f.primary).map(fieldHTML).join("")
+        : allFields.map(fieldHTML).join("");
+
+    const cookieBlock =
+      site.credential === "cookie"
+        ? `<div class="field-label">Cookie ${reqLabel(site)}</div>
+           <textarea data-field="cookie" rows="4" spellcheck="false" placeholder="在这里粘贴 cookie 原文，支持：浏览器 Cookie 面板整块复制 / name=value; ... 串 / JSON / curl 里的 Cookie 头">${esc(account.cookie || "")}</textarea>
+           <div class="row">
+             <button class="tiny accent" data-action="normalize" data-key="${site.key}" data-index="${index}">规范化</button>
+             ${site.verify ? `<button class="tiny accent" data-action="verify" data-key="${site.key}">校验</button>` : ""}
+             <span class="spacer"></span>
+             <span class="muted" style="font-size:11.5px" data-role="count">${check ? check.count + " 个字段" : ""}</span>
+           </div>
+           <div class="check ${check ? (check.ok ? "ok" : "bad") : ""}" data-role="check">${checkHTML(check)}</div>`
+        : "";
+
+    // 这些字段的定位随凭据类型变：表单类站点的字段**就是**凭据（账号密码、token…），
+    // 必须直接摊开；cookie 类站点的字段只是可选补充项，收进 <details> 免得抢戏。
+    // 以前一律塞进折叠区，结果表单类站点新建一个账号后打开是一片「其它参数（可选）」
+    // 折叠条 —— 想输账号密码还得先点开，等于凭空多一步。
+    const extraFields = site.credential === "cookie" ? allFields.filter((f) => !f.primary) : allFields;
+    const fieldsBlock = !extraFields.length
+      ? ""
+      : site.credential === "cookie"
+        ? `<details class="extras" ${hasNonEmpty(account, extraFields) ? "open" : ""}><summary>其它参数（${extraFields.length} 项，可选）</summary><div class="grid2">${extras}</div></details>`
+        : `<div class="field-label">参数 ${reqLabel(site) || ""}</div><div class="grid2">${extras}</div>`;
+
+    // 这个站点拿不到用户 ID（模块输出里没有、配置里也没有）：通知里只能靠备注区分，
+    // 所以直接写在账号块上，不让人配完才发现两个账号长得一样。
+    const idNote =
+      site.auto_id === false && !String(account.remark || "").trim()
+        ? `<div class="acc-note">该站点无法自动获取用户ID，请输入账号备注</div>`
+        : "";
+
+    return `
+<div class="account" data-index="${index}">
+  <div class="acc-head">
+    <b>账号 ${index + 1}</b>
+    <input class="acc-remark" data-field="remark" value="${esc(account.remark || "")}" maxlength="24" autocomplete="off" placeholder="${site.auto_id === false ? "备注（必填，将显示为账号信息）" : "备注（可选，将显示为账号信息）"}">
+    <button class="ghost tiny" data-action="remove" data-key="${site.key}" data-index="${index}">删除</button>
+  </div>
+  ${idNote}
+  ${cookieBlock}
+  ${primaryBlock}
+  ${fieldsBlock}
+</div>`;
+  }
+
+  const reqLabel = (site) =>
+    (site.required || []).length ? `<span class="req">必填：${site.required.map(esc).join("、")}</span>` : "";
+
+  function hasNonEmpty(account, fields) {
+    return (fields || []).some((f) => {
+      const v = account[f.key];
+      return v !== undefined && v !== "" && v !== null;
+    });
+  }
+
+  function truncate(text, n) {
+    text = String(text || "").replace(/\s+/g, " ");
+    return text.length > n ? text.slice(0, n) + "…" : text;
+  }
+
+  function checkHTML(check) {
+    if (!check) return "";
+    const parts = [];
+    if (check.missing && check.missing.length) parts.push(`缺少必填字段：${check.missing.join("、")}`);
+    else if (check.ok) parts.push(`格式正常，共 ${check.count} 个字段`);
+    else if (check.message) parts.push(check.message);
+    if (check.source && check.source !== "unknown") parts.push(`识别为 ${check.source}`);
+    let html = esc(parts.join("｜"));
+    if (check.keys && check.keys.length) {
+      const chips = check.keys.map((k) => `<span class="chip have">${esc(k)}</span>`).join("");
+      const miss = (check.missing || []).map((k) => `<span class="chip miss">${esc(k)}</span>`).join("");
+      html += `<div class="chips" style="margin-top:6px">${chips}${miss}</div>`;
+    }
+    if (check.warnings && check.warnings.length) {
+      html += `<ul>${check.warnings.map((w) => `<li>${esc(w)}</li>`).join("")}</ul>`;
+    }
+    if (check.needs_fix && check.ok) {
+      html += `<div style="margin-top:6px"><span class="chip miss">格式不是引擎标准形态，建议点「规范化」</span></div>`;
+    }
+    return html;
+  }
+
+  /* ======================================================================
+     卡片交互 / 站点配置弹窗
+     ====================================================================== */
+  function findSite(key) { return currentSites().find((s) => s.key === key); }
+  function draftOf(key) {
+    if (!S.drafts[key]) S.drafts[key] = [];
+    return S.drafts[key];
+  }
+
+  /* 点「添加账号」造出来的空壳。WeakSet 而不是给对象加字段：加字段会污染
+     saveSite 的空账号过滤（那里按「有任何非空值就算有效」判断），也会顺带
+     写进 config.json。用户一旦真输入过就从集合里踢掉，不再自动回收。 */
+  const BLANK_NEW = new WeakSet();
+
+  function isBlankAccount(account) {
+    return Object.keys(account).every((k) => String(account[k] == null ? "" : account[k]).trim() === "");
+  }
+
+  /* dirty 不再「一动手就 true」：和打开/保存时的快照比，真的不一样才算改过。
+     这样「点添加账号 → 没输入 → 关掉」会把空壳丢掉，卡片也不会留一句
+     「有未保存的改动」。 */
+  function snapshot(key) {
+    S.base[key] = JSON.stringify(draftOf(key));
+    return S.base[key];
+  }
+
+  function syncDirty(key) {
+    S.dirty[key] = JSON.stringify(draftOf(key)) !== S.base[key];
+  }
+
+  /* 同一份数据有两处 DOM：网格里的卡片（概览）和弹窗（编辑区）。
+     卡片可以整块换掉（简单），弹窗里的表单正在被编辑，只能就地重画内容区。 */
+  function repaintSite(key) {
+    const site = findSite(key);
+    if (!site) return;
+    // 限定在 #sites 里找：弹窗内容区也带 data-key，不限定的话会误抓弹窗那个
+    const el = document.querySelector(`#sites [data-key="${key}"]`);
+    if (!el) {
+      render();
+    } else {
+      const wrapper = document.createElement("div");
+      wrapper.innerHTML = S.view === "list" ? siteRow(site) : siteCard(site);
+      el.replaceWith(wrapper.firstElementChild);
+    }
+    if (S.dlgKey === key) paintSiteDialog();
+  }
+
+  /* 弹窗内容整个从「当前草稿」重画，所以加账号 / 删账号之后重新渲染也不会丢用户
+     刚输入的 cookie —— 草稿才是唯一数据源，DOM 只是它的投影。 */
+  function dlgHint(key) {
+    const n = draftOf(key).length;
+    return `${n ? n + " 个账号" : "还没有账号"}${S.dirty[key] ? " · 有未保存的改动" : ""}`;
+  }
+
+  function paintSiteDialog() {
+    const key = S.dlgKey;
+    const site = key && findSite(key);
+    if (!site) { closeSite(); return; }
+    $("siteDlgTitle").innerHTML = `${logoHTML(site, true)}
+      <span class="names"><b>${esc(site.label)}</b><span>${esc(site.key)}</span></span>
+      <span class="tag">${esc(site.group || "其它")}</span>${statusBadge(site)}`;
+    const body = $("siteDlgBody");
+    body.dataset.key = key;
+    body.innerHTML = dlgBodyHTML(site, draftOf(key));
+    $("siteDlgHint").textContent = dlgHint(key);
+    ["siteDlgAdd", "siteDlgRun", "siteDlgSave"].forEach((id) => ($(id).dataset.key = key));
+  }
+
+  function openSite(key) {
+    S.dlgKey = key;
+    const dlg = $("siteDlg");
+    // 已经把某个站点的弹窗开着时再点另一张卡：内容换掉即可，别关掉再开（会闪一下）
+    if (!dlg.open) dlg.showModal();
+    paintSiteDialog();
+  }
+
+  /* 关闭只走这一条路：Esc、点遮罩、点「关闭」都最终触发 close 事件，
+     收尾（清 key、把提示搬回 body）统一挂在那个监听里，免得漏。 */
+  function closeSite() {
+    const dlg = $("siteDlg");
+    if (dlg.open) dlg.close();
+  }
+
+  function onSiteDialogClosed() {
+    const key = S.dlgKey;
+    S.dlgKey = null;
+    /* 关窗时回收「点了添加账号但一个字没填」的空壳：以前它会一直挂在草稿里，
+       卡片上就永远写着「1 个账号 · 有未保存的改动」。用户真输入过的（已经从
+       BLANK_NEW 里踢掉了）不动，只丢从没碰过的空账号。 */
+    if (key && S.drafts[key]) {
+      const list = draftOf(key);
+      const kept = list.filter((a) => !(BLANK_NEW.has(a) && isBlankAccount(a)));
+      kept.forEach((a) => BLANK_NEW.delete(a));
+      if (kept.length !== list.length) {
+        S.drafts[key] = kept;
+        S.checks[key] = (S.checks[key] || []).slice(0, kept.length);
+        syncDirty(key);              // 空壳不算改动，dirty 应该回落到 false
+        refreshCardFooter(key);
+        repaintSite(key);
+      }
+    }
+    const body = $("siteDlgBody");
+    body.innerHTML = "";
+    body.dataset.key = "";
+    if ($("toast").parentNode !== document.body) document.body.appendChild($("toast"));
+  }
+
+  function refreshCardFooter(key) {
+    const el = document.querySelector(`#sites [data-key="${key}"] .card-meta`);
+    if (el) {
+      const accounts = draftOf(key);
+      const meta = [accounts.length ? `${accounts.length} 个账号` : "未配置"];
+      if (S.dirty[key]) meta.push("有未保存的改动");
+      el.textContent = meta.join(" · ");
+      el.title = el.textContent;
+    }
+    if (S.dlgKey === key) $("siteDlgHint").textContent = dlgHint(key);
+  }
+
+  /* 编辑区（表单）当前在哪：弹窗开着就是弹窗，否则是网格里的那张卡。
+     规范化的结果显示、新增账号后的聚焦都要落在这块里。 */
+  function editScope(key) {
+    if (S.dlgKey === key) return $("siteDlgBody");
+    return document.querySelector(`#sites [data-key="${key}"]`);
+  }
+
+  document.addEventListener("click", async (ev) => {
+    // 卡片和列表行整块可点，但里面的「官网」是真链接 —— 别把跳转吃掉。
+    if (ev.target.closest("a")) return;
+    const btn = ev.target.closest("[data-action]");
+    if (!btn) return;
+    const action = btn.dataset.action;
+    const key = btn.dataset.key;
+    const index = btn.dataset.index != null ? Number(btn.dataset.index) : null;
+
+    if (action === "reset-filter") {
+      $("search").value = "";
+      $("filter").value = "all";
+      $("groupFilter").value = "all";
+      S.onlyTodo = false;
+      $("btnOnlyTodo").classList.remove("on");
+      render();
+      return;
+    }
+
+    if (action === "open") { openSite(key); return; }
+
+    if (action === "add") {
+      const site = findSite(key);
+      const blank = {};
+      if (site.credential === "cookie") blank.cookie = "";
+      BLANK_NEW.add(blank);
+      S.drafts[key] = [...draftOf(key), blank];
+      S.checks[key] = [...(S.checks[key] || []), null];
+      syncDirty(key);
+      repaintSite(key);
+      // 光标直接落到刚加的那个（空）输入框上，粘贴就完事。
+      // 只聚焦新加的这块：老账号的 cookie 框一聚焦就会解除遮蔽，等于把明文摊开。
+      const scope = editScope(key);
+      const n = draftOf(key).length - 1;
+      const box = scope && scope.querySelector(`.account[data-index="${n}"] textarea, .account[data-index="${n}"] input`);
+      if (box) box.focus();
+      return;
+    }
+
+    if (action === "remove") {
+      S.drafts[key] = draftOf(key).filter((_, i) => i !== index);
+      S.checks[key] = (S.checks[key] || []).filter((_, i) => i !== index);
+      syncDirty(key);
+      repaintSite(key);
+      return;
+    }
+
+    if (action === "normalize") {
+      const account = draftOf(key)[index];
+      if (!account || !account.cookie) return toast("先粘贴 cookie");
+      btn.disabled = true;
+      try {
+        const r = await api("/cookies/normalize", { method: "POST", body: { raw: account.cookie, site: key } });
+        account.cookie = r.cookie || account.cookie;
+        (S.checks[key] || [])[index] = r;
+        syncDirty(key);
+        repaintSite(key);
+        toast(`已规范化：${r.count} 个字段（来源：${r.source}）`);
+      } catch (e) { toast(e.message); } finally { btn.disabled = false; }
+      return;
+    }
+
+    if (action === "verify") {
+      btn.disabled = true;
+      btn.textContent = "校验中…";
+      try {
+        const r = await api(`/sites/${key}/verify`, { method: "POST", body: {} });
+        const site = findSite(key);
+        if (site) {
+          site.status = {
+            state: r.state,
+            source: "api",
+            checked_at: Date.now() / 1000,
+            message: (r.results || []).map((x) => x.message).join("；"),
+          };
+        }
+        repaintSite(key);
+        const map = { valid: "有效", invalid: "已失效", unknown: "无法判定", unverified: "没有配置账号" };
+        toast(`${site ? site.label : key}：${map[r.state] || r.state}`);
+      } catch (e) { toast(e.message); } finally { btn.disabled = false; btn.textContent = "校验"; }
+      return;
+    }
+
+    if (action === "save") { await saveSite(key); return; }
+    // 「立即签到」：先收起弹窗再开运行面板 —— 抽屉在弹窗（顶层）之下，不关掉就看不见输出
+    if (action === "run") { closeSite(); await startRun([key]); return; }
+  });
+
+  document.addEventListener("input", (ev) => {
+    const card = ev.target.closest("[data-key]");
+    if (!card) return;
+    const key = card.dataset.key;
+    const accEl = ev.target.closest(".account");
+    if (!accEl) return;
+    const index = Number(accEl.dataset.index);
+    const account = draftOf(key)[index];
+    if (!account) return;
+    BLANK_NEW.delete(account);   // 碰过就不再是「空壳」，关窗时不回收
+
+    if (ev.target.dataset.field === "cookie") {
+      account.cookie = ev.target.value;
+      syncDirty(key);
+      refreshCardFooter(key);
+      scheduleNormalize(key, index);
+    } else if (ev.target.dataset.field) {
+      const field = ev.target.dataset.field;
+      account[field] = ev.target.type === "checkbox" ? ev.target.checked : ev.target.value;
+      syncDirty(key);
+      refreshCardFooter(key);
+    }
+  });
+
+  document.addEventListener("change", (ev) => {
+    const card = ev.target.closest("[data-key]");
+    if (!card || ev.target.type !== "checkbox") return;
+    const key = card.dataset.key;
+    const accEl = ev.target.closest(".account");
+    if (!accEl || !ev.target.dataset.field) return;
+    const account = draftOf(key)[Number(accEl.dataset.index)];
+    if (!account) return;
+    BLANK_NEW.delete(account);
+    account[ev.target.dataset.field] = ev.target.checked;
+    syncDirty(key);
+    refreshCardFooter(key);
+  });
+
+  const normalizeTimers = {};
+  function scheduleNormalize(key, index) {
+    const id = key + ":" + index;
+    clearTimeout(normalizeTimers[id]);
+    normalizeTimers[id] = setTimeout(async () => {
+      const account = draftOf(key)[index];
+      if (!account || !account.cookie) return;
+      try {
+        const r = await api("/cookies/normalize", { method: "POST", body: { raw: account.cookie, site: key } });
+        (S.checks[key] || [])[index] = r;
+        const scope = editScope(key);
+        const accEl = scope && scope.querySelector(`.account[data-index="${index}"]`);
+        if (!accEl) return;
+        const box = accEl.querySelector('[data-role="check"]');
+        const cnt = accEl.querySelector('[data-role="count"]');
+        if (box) {
+          box.className = "check " + (r.ok ? "ok" : "bad");
+          box.innerHTML = checkHTML(r);
+        }
+        if (cnt) cnt.textContent = `${r.count} 个字段`;
+      } catch (_) { /* 输入过程中的网络抖动直接忽略 */ }
+    }, 400);
+  }
+
+  async function saveSite(key) {
+    const site = findSite(key);
+    if (!site) return;
+    const accounts = draftOf(key).filter((a) => Object.values(a).some((v) => String(v == null ? "" : v).trim() !== ""));
+    try {
+      await api(`/sites/${key}/accounts`, { method: "POST", body: { accounts } });
+      S.drafts[key] = accounts.map((a) => ({ ...a }));
+      snapshot(key);               // 保存后的状态就是新基线
+      S.dirty[key] = false;
+      site.accounts = accounts;
+      site.configured = accounts.length > 0;
+      toast(`${site.label}：已保存 ${accounts.length} 个账号`);
+      await loadState(true);
+    } catch (e) { toast("保存失败：" + e.message); }
+  }
+
+  /* ======================================================================
+     运行
+     ====================================================================== */
+  async function startRun(sites) {
+    try {
+      const r = await api("/run", { method: "POST", body: { sites } });
+      S.runId = r.id;
+      openDrawer("live");
+      $("console").textContent = "任务已创建，等待输出…\n";
+      pollRun();
+    } catch (e) { toast(e.message); }
+  }
+
+  async function verifyAll() {
+    try {
+      const r = await api("/verify", { method: "POST", body: {} });
+      S.runId = r.id;
+      openDrawer("live");
+      $("console").textContent = "开始批量校验…\n";
+      pollRun();
+    } catch (e) { toast(e.message); }
+  }
+
+  function pollRun() {
+    clearTimeout(S.pollTimer);
+    if (!S.runId) return;
+    S.pollTimer = setTimeout(async () => {
+      try {
+        const run = await api("/runs/" + S.runId);
+        const text = (run.lines || []).join("\n");
+        const box = $("console");
+        const atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 40;
+        box.textContent = text || "…";
+        if (atBottom) box.scrollTop = box.scrollHeight;
+        $("drawerTitle").textContent =
+          runLabel(run) + " · " +
+          ({ running: "运行中", done: "已完成", failed: "失败" }[run.status] || run.status) + " · " +
+          Math.round((run.finished_at || Date.now() / 1000) - run.started_at) + "s";
+        if (run.status === "running") return pollRun();
+        S.runId = null;
+        await loadState(true);
+        if (run.kind === "verify") {
+          toast(run.status === "done" ? "批量校验完成" : "校验结束但有问题，请看输出");
+        } else {
+          // 关键提醒：签到任务跑通 ≠ cookie 有效（部分站点模块对无效 cookie 是静默返回的）
+          toast(run.status === "done" ? "签到任务完成 —— 有效性请以「校验」的结论为准" : "签到任务结束但有问题，请看输出", 4200);
+        }
+      } catch (e) {
+        $("console").textContent += "\n[面板] 读取任务状态失败：" + e.message;
+      }
+    }, 900);
+  }
+
+  async function loadHistory() {
+    try {
+      const r = await api("/runs");
+      const runs = r.runs || [];
+      $("history").innerHTML = runs.length
+        ? runs.map((run) => `
+      <div class="hist">
+        <div class="h-main">
+          <b>${runLabel(run)}</b>
+          <span>${esc((run.site_keys || []).join("、") || "全部站点")} · 用时 ${run.finished_at ? Math.round(run.finished_at - run.started_at) + " 秒" : "运行中"}</span>
+        </div>
+        <span class="spacer"></span>
+        <span class="badge ${run.status === "done" ? "valid" : run.status === "running" ? "unknown" : "invalid"}">${{ running: "运行中", done: "成功", failed: "失败" }[run.status] || run.status}</span>
+        <span class="muted" style="font-size:11.5px">${fmtTime(run.started_at)}</span>
+        <button class="tiny" data-history="${run.id}">查看输出</button>
+      </div>`).join("")
+        : `<p class="muted">还没有历史任务</p>`;
+    } catch (e) { toast(e.message); }
+  }
+
+  async function loadLogs() {
+    try {
+      const r = await api("/logs?lines=500&name=" + encodeURIComponent($("logFile").value || "dailycheckin-plus.log"));
+      const sel = $("logFile");
+      if (!sel.options.length) {
+        sel.innerHTML = (r.files || []).map((f) => `<option value="${esc(f.name)}">${esc(f.name)}（${Math.round(f.size / 1024)} KB）</option>`).join("") || `<option value="dailycheckin-plus.log">dailycheckin-plus.log</option>`;
+        sel.value = r.name;
+      }
+      $("logText").textContent = r.text || "（日志为空）";
+    } catch (e) { $("logText").textContent = "读取失败：" + e.message; }
+  }
+
+  /* ======================================================================
+     抽屉 / 设置
+     ====================================================================== */
+  function openDrawer(tab) {
+    $("drawer").classList.add("open");
+    $("overlay").classList.add("open");
+    if (tab) switchTab(tab);
+  }
+  function closeDrawer() {
+    $("drawer").classList.remove("open");
+    $("overlay").classList.remove("open");
+  }
+  function switchTab(name) {
+    document.querySelectorAll(".tabs button").forEach((b) => b.classList.toggle("active", b.dataset.tab === name));
+    document.querySelectorAll("[data-panel]").forEach((p) => p.classList.toggle("hidden", p.dataset.panel !== name));
+    clearInterval(S.logTimer);
+    if (name === "history") loadHistory();
+    if (name === "log") { loadLogs(); S.logTimer = setInterval(loadLogs, 10000); }
+  }
+
+  /* ======================================================================
+     推送通知：按「渠道」分组
+     ====================================================================== */
+  /* 每个渠道一个方框：同一家的字段聚在一起，不用在一大片输入框里找。
+     方框同排等高由 CSS 保证（.notices 的 align-items: stretch）—— 所以每个方框
+     底部都钉一行状态，被拉高时空白落在字段与状态之间，看上去是留白，而不是没对齐。
+     窄方框里「字段名 + 配置键」放不下，配置键允许省略号截断，完整值挂 title。 */
+  function nfHTML(key, label, value, full) {
+    return `<label class="nf" title="${esc((full || label) + " · " + key)}">
+      <span class="nf-top"><span class="nf-label">${esc(label)}</span><span class="nf-key">${esc(key)}</span></span>
+      <input type="text" data-notice="${esc(key)}" value="${esc(value || "")}" autocomplete="off" spellcheck="false"></label>`;
+  }
+
+  function noticeHTML(st) {
+    const groups = st.notice_groups || [];
+    const notice = st.notice || {};
+    // 后端还没给分组信息时（理论上不会）退化成一个大方框，至少不影响填写。
+    if (!groups.length) {
+      return `<section class="nbox wide">
+        <header class="nbox-head"><i class="nbox-dot"></i><b>推送字段</b></header>
+        <div class="nbox-fields">${(st.notice_keys || []).map((k) => nfHTML(k.key, k.label, notice[k.key], k.label)).join("")}</div>
+      </section>`;
+    }
+    return groups.map((g) => {
+      const filled = g.fields.filter((f) => (notice[f.key] || "").trim()).length;
+      const foot = filled
+        ? `<b class="nbox-count">已配置 ${filled} 项</b>`
+        : `<span class="nbox-idle">未配置</span>`;
+      return `<section class="nbox${g.wide ? " wide" : ""}${filled ? " on" : ""}">
+        <header class="nbox-head"><i class="nbox-dot"></i><b>${esc(g.name)}</b>
+          <span class="nbox-tag">${g.fields.length} 项</span></header>
+        <div class="nbox-fields">${g.fields.map((f) => nfHTML(f.key, f.label, notice[f.key], f.full)).join("")}</div>
+        <p class="nbox-foot">${foot}</p>
+      </section>`;
+    }).join("");
+  }
+
+  /* ======================================================================
+     项目地址 + 「当前容器要不要更新」
+     ====================================================================== */
+  const UP = { busy: false, data: null, autoTried: false };
+
+  const fmtDay = (iso) => {
+    const d = new Date(iso || "");
+    if (isNaN(d.getTime())) return (iso || "").slice(0, 10);
+    const p = (n) => String(n).padStart(2, "0");
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+  };
+
+  /* 画「当前版本 / 最新版本」。只有设置页最下方的「关于本项目」用得到 ——
+     首页那处右下角小牌已经删掉，别再加回来。
+     只报两行数字：当前版本是本机代码里的 VERSION；最新版本是 ghcr 上 latest 那份镜像
+     自带的版本标签 —— 所以「最新版本」就等于你 pull 镜像会拿到的那份，
+     不会出现「提示有新版本、拉下来一模一样」，也就**不需要**在这里放更新命令了。
+     结论只有三种，别再自己发明第四种：
+       needs_update === true   最新版本更高 → 橙色圆点
+       needs_update === false  已是最新 → 绿色圆点
+       needs_update === null   判断不了 / 检查失败 → 灰点 + 下面一行小字说明理由 */
+  function paintUpdate(info) {
+    if (!info) return;
+    // /api/state 带的是「只有本地版本」的简版（没有 checked_at）。已经查到过结果，
+    // 就别让简版把结论抹掉 —— 只更新其中已知的本地字段。
+    if (info.checked_at === undefined && UP.data && UP.data.checked_at !== undefined) {
+      info = Object.assign({}, info, UP.data);
+    }
+    UP.data = info;
+
+    const url = info.url || (info.repo ? "https://github.com/" + info.repo : "");
+    const link = $("aboutRepo");
+    if (link && url) link.href = url;
+    if ($("aboutRepoName")) $("aboutRepoName").textContent = info.repo || "项目地址";
+
+    // 当前版本只写版本号；构建提交挪进 title，想查是哪个提交构建的悬停就能看到。
+    const localEl = $("aboutLocal");
+    if (localEl) {
+      localEl.textContent = info.version ? "v" + info.version : "—";
+      localEl.title = info.short ? `构建 ${info.short}` : "未记录构建信息";
+    }
+
+    const remote = info.remote || {};
+    let dot = "muted", text = "—", tip = "";
+    if (info.ok === false) {
+      text = "检查失败";
+      tip = info.error || "检查更新失败";
+    } else if (info.ok === true) {
+      if (info.needs_update === true) {
+        dot = "warn";
+        // 远端版本号来自镜像标签；老镜像没有标签就退回提交短 sha，不硬凑版本号
+        text = remote.version ? `v${remote.version}` : (remote.short || "有更新");
+        tip = "有新版本，拉取新镜像即可";
+      } else if (info.needs_update === false) {
+        dot = "ok";
+        text = remote.version ? `v${remote.version}` : (info.version ? `v${info.version}` : "—");
+        tip = "已是最新";
+      } else {
+        text = "无法判断";
+        tip = info.hint || "判断不了最新版本";
+      }
+    }
+
+    const dotEl = $("aboutDot");
+    if (dotEl) dotEl.className = "up-dot " + dot;
+    const txtEl = $("aboutUpdateText");
+    if (txtEl) txtEl.textContent = text;
+    const box = $("aboutUpdate");
+    if (box) {
+      box.className = "foot-up " + dot;
+      box.title = tip;
+    }
+    // 正常状态下面这行是隐藏的 —— 「简单点」：页面上只留两行版本号。
+    const aboutTip = $("aboutTip");
+    if (aboutTip) {
+      const msg = info.ok === false
+        ? (info.error || "检查更新失败")
+        : info.ok === true && info.needs_update === null ? tip : "";
+      aboutTip.textContent = msg;
+      aboutTip.hidden = !msg;
+    }
+  }
+
+  async function checkUpdate(force = false) {
+    if (UP.busy) return;
+    UP.busy = true;
+    document.querySelectorAll(".js-check-update").forEach((b) => { b.disabled = true; });
+    try {
+      const r = await api("/update" + (force ? "?force=1" : ""));
+      paintUpdate(r);
+      if (force) {
+        const rv = (r.remote || {}).version;
+        toast(
+          r.ok === false ? r.error
+            : r.needs_update === true ? (rv ? `有新版本 v${rv}` : "有新镜像，可以更新了")
+              : r.needs_update === false ? "已是最新"
+                : (r.hint || "判断不了")
+        );
+      }
+    } catch (e) {
+      paintUpdate(Object.assign({}, UP.data || {}, { ok: false, error: "检查更新失败：" + e.message, needs_update: null }));
+      if (force) toast("检查更新失败：" + e.message);
+    } finally {
+      UP.busy = false;
+      document.querySelectorAll(".js-check-update").forEach((b) => { b.disabled = false; });
+    }
+  }
+
+  /* 定时校验的说明行：一行说清「上次 / 下次 + 规矩」，别写成一段话 */
+  function verifyTip(vs) {
+    if (!vs || !vs.enabled) return "已关闭。打开后按 cron 定期在线校验已配置站点，全部有效时不打扰你。";
+    const short = (ts) => (ts ? fmtTime(ts).slice(5, 16) : "—");
+    // 相对时间按时间戳直接算，不受浏览器时区影响：开着代理/改过时区的浏览器
+    // 会把 fmtTime 的绝对时间显示成另一个钟点，光看「18:00」容易误判成「算错了」。
+    const until = (ts) => {
+      if (!ts) return "";
+      const s = ts - Date.now() / 1000;
+      if (s <= 0) return "（已到点，马上执行）";
+      if (s < 60) return "（不到 1 分钟）";
+      if (s < 3600) return `（还有 ${Math.floor(s / 60)} 分钟）`;
+      const h = Math.floor(s / 3600);
+      const m = Math.floor((s % 3600) / 60);
+      return m ? `（还有 ${h} 小时 ${m} 分）` : `（还有 ${h} 小时）`;
+    };
+    const last = vs.last_run_at ? `上次 ${short(vs.last_run_at)}` : "还没跑过";
+    const next = `${short(vs.next_run_at)}${until(vs.next_run_at)}`;
+    const bad = (vs.last_result && (vs.last_result.invalid || []).length) || 0;
+    const err = vs.last_error ? `｜出错：${vs.last_error}` : "";
+    return `${last}${bad ? `（${bad} 个站点失效）` : ""} ｜ 下次 ${next} —— 只校验已配置且有在线接口的站点；全部有效时静默；同一批失效每 ${vs.remind_after_hours || 24} 小时最多提醒一次。${err}`;
+  }
+
+  async function openSettings() {
+    const st = S.state;
+    const sch = st.schedule;
+    $("schEnabled").checked = sch.enabled;
+    $("schPreset").innerHTML =
+      sch.presets.map((p) => `<option value="${esc(p.cron)}">${esc(p.label)}</option>`).join("") +
+      `<option value="__custom">自定义</option>`;
+    $("schCron").value = sch.cron;
+    $("schPreset").value = sch.presets.some((p) => p.cron === sch.cron) ? sch.cron : "__custom";
+    $("schTip").textContent = `crontab 文件：${sch.crontab_path}（只改标记区块，其它行不动）`;
+
+    const vs = st.verify_schedule || {};
+    const vpresets = vs.presets || [];
+    $("vsEnabled").checked = vs.enabled !== false;
+    $("vsNotify").checked = vs.notify !== false;
+    $("vsPreset").innerHTML =
+      vpresets.map((p) => `<option value="${esc(p.cron)}">${esc(p.label)}</option>`).join("") +
+      `<option value="__custom">自定义</option>`;
+    $("vsCron").value = vs.cron || "0 */6 * * *";
+    $("vsPreset").value = vpresets.some((p) => p.cron === vs.cron) ? vs.cron : "__custom";
+    $("vsTip").textContent = verifyTip(vs);
+
+    $("accCurrent").textContent = (S.auth && S.auth.username) || st.panel.user || "—";
+    $("accUser").value = (S.auth && S.auth.username) || st.panel.user || "";
+    $("accOld").value = $("accNew").value = $("accNew2").value = "";
+    $("accTip").textContent = S.auth && S.auth.auth_path ? `凭据存放：${S.auth.auth_path}` : "";
+
+    $("noticeGroups").innerHTML = noticeHTML(st);
+
+    $("configTip").textContent = `路径：${st.panel.config_path}`;
+
+    try {
+      const raw = await api("/config/raw");
+      $("configRaw").value = raw.text;
+    } catch (e) { $("configRaw").value = "读取失败：" + e.message; }
+
+    const bks = st.backups || [];
+    $("backupSelect").innerHTML = bks.length
+      ? bks.map((b) => `<option value="${esc(b.name)}">${esc(b.name)}</option>`).join("")
+      : `<option value="">（暂无备份）</option>`;
+
+    const up = (st.engine && st.engine.upstream) || {};
+    const gaps = (st.engine && st.engine.sites_without_meta) || [];
+    const lines = [
+      `版本       : ${st.panel.version}`,
+      `引擎状态   : ${st.engine.ok ? "正常" : "异常"} — ${st.engine.message}`,
+      up.commit
+        ? `引擎来源   : fork 自 ${up.repo} · ${up.commit.slice(0, 10)}${up.commit_date ? "（" + up.commit_date.slice(0, 10) + "）" : ""}`
+        : "引擎来源   : 未记录 fork 来源",
+      `引擎维护   : 本仓库自行维护${up.detached_at ? `（${up.detached_at.slice(0, 10)} 起与上游脱钩）` : ""}`,
+      gaps.length ? `待补元数据 : ${gaps.join("、")}（可正常签到，只是没有必填字段提示与在线校验）` : null,
+      `工作目录   : ${st.panel.home}`,
+      `配置文件   : ${st.panel.config_path}`,
+      `后台账号   : ${(S.auth && S.auth.username) || st.panel.user || "未设置"}`,
+      `凭据文件   : ${(S.auth && S.auth.auth_path) || "—"}`,
+      `脚本口令   : ${st.panel.token_bypass ? "已启用 PANEL_TOKEN" : "未启用"}`,
+      `时区       : ${st.panel.tz}`,
+      `面板时间   : ${fmtTime(st.server_time)}`,
+    ];
+    $("envInfo").textContent = lines.filter((l) => l !== null).join("\n");
+
+    $("settings").showModal();
+  }
+
+  async function saveAccount() {
+    const old = $("accOld").value;
+    const user = $("accUser").value.trim();
+    const p1 = $("accNew").value;
+    const p2 = $("accNew2").value;
+    if (!old) return toast("请先填写当前密码");
+    if (!user) return toast("账号不能为空");
+    if (p1 || p2) {
+      if (p1 !== p2) return toast("两次输入的新密码不一致");
+      if (p1.length < ((S.auth && S.auth.min_pass) || 6)) return toast(`新密码至少 ${(S.auth && S.auth.min_pass) || 6} 位`);
+    }
+    const body = { old_password: old };
+    if (user !== ((S.auth && S.auth.username) || "")) body.username = user;
+    if (p1) body.new_password = p1;
+    try {
+      const r = await api("/auth/credentials", { method: "POST", body });
+      if (S.auth) S.auth.username = r.username;
+      $("accCurrent").textContent = r.username;
+      $("accOld").value = $("accNew").value = $("accNew2").value = "";
+      toast(r.password_changed ? "已更新：账号 + 密码" : "账号设置已更新");
+      await loadState(true);
+    } catch (e) { toast(e.message); }
+  }
+
+  /* ======================================================================
+     绑定
+     ====================================================================== */
+  function bind() {
+    $("btnRefresh").onclick = () => loadState();
+    $("btnRunAll").onclick = () => startRun([]);
+    $("btnVerifyAll").onclick = () => verifyAll();
+    $("btnDrawer").onclick = () => openDrawer("live");
+    $("btnDrawerClose").onclick = closeDrawer;
+    $("overlay").onclick = closeDrawer;
+    $("btnClearConsole").onclick = () => { $("console").textContent = ""; };
+    $("btnCloseSiteDlg").onclick = closeSite;
+    $("siteDlg").addEventListener("close", onSiteDialogClosed);
+    // 点弹窗外面那块变暗的区域关掉它（原生 dialog 的遮罩点击落在 dialog 自己身上）
+    $("siteDlg").addEventListener("click", (ev) => { if (ev.target === $("siteDlg")) closeSite(); });
+    $("search").oninput = render;
+    $("filter").onchange = render;
+    $("groupFilter").onchange = render;
+    $("sortSelect").value = S.sort;
+    $("sortSelect").onchange = () => {
+      const v = $("sortSelect").value;
+      S.sort = SORT_MODES.includes(v) ? v : "configured";
+      lsSet("dc_sort", S.sort);
+      render();
+    };
+    $("maskCookie").onchange = () => document.body.classList.toggle("masked", $("maskCookie").checked);
+    $("btnOnlyTodo").onclick = () => {
+      S.onlyTodo = !S.onlyTodo;
+      $("btnOnlyTodo").classList.toggle("on", S.onlyTodo);
+      render();
+    };
+    $("btnReloadLog").onclick = loadLogs;
+    $("logFile").onchange = loadLogs;
+
+    document.querySelectorAll("#viewSeg button").forEach((b) => {
+      b.classList.toggle("active", b.dataset.view === S.view);
+      b.onclick = () => {
+        S.view = b.dataset.view === "list" ? "list" : "card";
+        lsSet("dc_view", S.view);
+        document.querySelectorAll("#viewSeg button").forEach((x) => x.classList.toggle("active", x === b));
+        render();
+      };
+    });
+
+    document.querySelectorAll(".tabs button").forEach((b) => (b.onclick = () => switchTab(b.dataset.tab)));
+
+    document.addEventListener("click", (ev) => {
+      const h = ev.target.closest("[data-history]");
+      if (h) {
+        S.runId = h.dataset.history;
+        switchTab("live");
+        pollRun();
+      }
+    });
+
+    $("btnSettings").onclick = openSettings;
+    // 设置弹窗只留底栏那一个「关闭」：右上角那个和它重复，已经去掉
+    $("btnCloseSettings2").onclick = () => $("settings").close();
+    $("btnSaveAccount").onclick = saveAccount;
+    $("btnLogout").onclick = logout;
+
+    $("schPreset").onchange = () => {
+      if ($("schPreset").value !== "__custom") $("schCron").value = $("schPreset").value;
+    };
+
+    $("btnSaveSchedule").onclick = async () => {
+      try {
+        const r = await api("/schedule", { method: "PUT", body: { enabled: $("schEnabled").checked, cron: $("schCron").value.trim() } });
+        toast(r.applied ? "定时任务已生效" : "已保存，但容器内 crontab 未能应用");
+        await loadState(true);
+      } catch (e) { toast("保存失败：" + e.message); }
+    };
+
+    $("vsPreset").onchange = () => {
+      if ($("vsPreset").value !== "__custom") $("vsCron").value = $("vsPreset").value;
+    };
+
+    $("btnSaveVerify").onclick = async () => {
+      try {
+        const r = await api("/verify-schedule", {
+          method: "PUT",
+          body: {
+            enabled: $("vsEnabled").checked,
+            cron: $("vsCron").value.trim(),
+            notify: $("vsNotify").checked,
+          },
+        });
+        $("vsTip").textContent = verifyTip(r);
+        toast(r.enabled ? "定时校验已生效" : "定时校验已关闭");
+        await loadState(true);
+      } catch (e) { toast("保存失败：" + e.message); }
+    };
+
+    // 更新检查的按钮有两处（主界面页脚 + 设置页最下方），同一套行为，别各写一份
+    document.querySelectorAll(".js-check-update").forEach((b) => {
+      b.onclick = () => checkUpdate(true);
+    });
+
+    $("btnSaveNotice").onclick = async () => {
+      const notice = {};
+      document.querySelectorAll("[data-notice]").forEach((el) => (notice[el.dataset.notice] = el.value.trim()));
+      try {
+        await api("/notice", { method: "POST", body: { notice } });
+        toast("推送设置已保存");
+        await loadState(true);
+      } catch (e) { toast("保存失败：" + e.message); }
+    };
+
+    $("btnReloadRaw").onclick = async () => {
+      try {
+        const raw = await api("/config/raw");
+        $("configRaw").value = raw.text;
+        toast("已重新载入");
+      } catch (e) { toast(e.message); }
+    };
+    $("btnSaveRaw").onclick = async () => {
+      try {
+        await api("/config/raw", { method: "PUT", body: { text: $("configRaw").value } });
+        toast("config.json 已保存");
+        await loadState(true);
+      } catch (e) { toast("保存失败：" + e.message); }
+    };
+    $("btnRestore").onclick = async () => {
+      const name = $("backupSelect").value;
+      if (!name) return toast("没有可恢复的备份");
+      if (!confirm(`用备份 ${name} 覆盖当前 config.json？`)) return;
+      try {
+        await api(`/backups/${encodeURIComponent(name)}/restore`, { method: "POST", body: {} });
+        toast("已恢复");
+        await loadState(true);
+        openSettings();
+      } catch (e) { toast(e.message); }
+    };
+
+    document.addEventListener("keydown", (ev) => {
+      // 卡片是 role=button：回车 / 空格要能打开配置弹窗
+      if ((ev.key === "Enter" || ev.key === " ") && !ev.repeat) {
+        const card = ev.target.closest && ev.target.closest('[data-action="open"][role="button"]');
+        if (card) {
+          ev.preventDefault();
+          openSite(card.dataset.key);
+          return;
+        }
+      }
+      if (ev.key === "Escape") {
+        // 站点弹窗开着时 Esc 归它自己（原生 dialog 会关），别再顺手把抽屉也关了
+        if (!$("siteDlg").open) closeDrawer();
+        return;
+      }
+      const typing = /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement.tagName);
+      // 弹窗开着时不抢「/」：焦点在弹窗里也搜不到背后的列表，白闪一下反而奇怪
+      if (ev.key === "/" && !typing && !document.querySelector("dialog[open]") && !$("app").classList.contains("hidden")) {
+        ev.preventDefault();
+        $("search").focus();
+      }
+    });
+  }
+
+  /* ---------------- 启动 ---------------- */
+  bind();
+
+  // 「隐藏 cookie」是纯前端的显示偏好，开机就定下来：别等第一次 render 之后才加
+  // masked —— 那中间已经渲染出来的 cookie 是明文的。
+  document.body.classList.toggle("masked", $("maskCookie").checked);
+
+  // 上次登录过就直接进主界面骨架。脚本在 body 末尾同步执行，浏览器首帧之前就跑完了，
+  // 所以不会再闪一下登录页。这只是「先画什么」，真伪仍由 /auth/status 定论 ——
+  // 万一会话过期了，它会把我们打回登录屏，代价只是这一次多闪一下。
+  if (readHint().l === true) hideGate();
+
+  gateCheck().catch((e) => {
+    showGate("login", "初始化失败：" + e.message);
+  });
+})();

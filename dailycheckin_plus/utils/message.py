@@ -1,0 +1,518 @@
+import base64
+import hashlib
+import hmac
+import json
+import re
+import time
+from urllib.parse import quote_plus
+import requests
+
+# 本项目的标识。通知标题、企业微信卡片里回跳的地址都取自这里，
+# 不再像上游那样在好几处分别写死同一个链接。改项目名只需要动这两行。
+PROJECT_NAME = "dailycheckin-plus"
+PROJECT_URL = "https://github.com/beacherz/dailycheckin-plus"
+
+# 各站点签到结果之间的分隔行。用全角破折号：所有推送渠道都能正常显示，
+# 不会被当成 markdown 语法，也不会像方块字符那样在不同字体下变成乱码。
+# 两级分隔：站点之间 16 个，同一站点的多个账号之间 8 个（短一半，层级一眼能看出来）。
+SITE_SEPARATOR = "\n" + "—" * 16 + "\n"
+ACCOUNT_SEPARATOR = "\n" + "—" * 8 + "\n"
+# 老名字保留，外部（自测、旧脚本）还在按它取站点分隔行。
+SEPARATOR = SITE_SEPARATOR
+
+# 渠道自带标题能力（server 酱 / PushPlus / Gotify / ntfy / 企业微信）时的兜底标题。
+# 正常情况下由 main.py 传进来一个带日期的标题；标题里始终带上项目名。
+NOTICE_TITLE = f"{PROJECT_NAME} 每日签到"
+
+# 从账号配置里挑「能认出是谁」的字段。cookie / token / password 一律不看。
+# remark 排第一：面板里手填的备注永远优先，因为它连「同一个人的两个号」都能区分。
+_HINT_KEYS = ("remark", "username", "account", "user", "mobile", "phone", "email", "nickname", "userid")
+
+
+def account_hint(item) -> str:
+    """给多账号场景挑一个人类可读的标识。
+
+    有些站点的签到输出里根本没有用户名（例如只有一个 cookie 的站点），
+    配了两个账号后通知里两段内容一模一样，只能靠序号猜。这里从配置里
+    找一个不敏感的身份字段补在标题后面。
+    """
+    if not isinstance(item, dict):
+        return ""
+    for key in _HINT_KEYS:
+        value = item.get(key)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return ""
+
+
+# 模块输出里的账号信息行，两种写法（账号 / 帐号）都认，冒号全角半角都认
+_ID_LINE_RE = re.compile(r"^\s*(?:账号信息|帐号信息)\s*[:：]\s*(.*)$")
+
+# 模块拿不到真实身份时爱写这些，等同于「没有」
+_GENERIC_IDS = {"未知用户", "未知", "已登录", "未登录", "none", "null", "-"}
+
+
+def _split_account_info(text: str) -> tuple:
+    """把模块输出里的账号信息行摘出来，剩下的才是正文。
+
+    上游各站点的写法很随意（`帐号信息` / `账号信息`、全角半角冒号、位置也不固定），
+    这里统一收编成一条，好让每条通知的第二行长得一模一样。
+    """
+    value = ""
+    rest = []
+    for line in str(text or "").splitlines():
+        match = _ID_LINE_RE.match(line)
+        if match and not value:
+            value = match.group(1).strip()
+            continue
+        rest.append(line)
+    if value.lower() in _GENERIC_IDS:
+        value = ""
+    return value, "\n".join(rest).strip()
+
+
+def render_site_block(name: str, accounts: list) -> str:
+    """渲染一个站点的全部账号（纯字符串处理，便于单测）。
+
+    每个账号统一成三段，标题永远是一行：
+
+    ```
+    「站名」
+    账号信息: xxx
+    <模块自己的输出>
+    ```
+
+    - 账号信息优先用模块返回的；模块没给（或只给了「未知用户」这种废话）就用
+      面板备注；都没有多账号时退回「第 N 个账号」，单账号写「—」
+    - 同一站点的多个账号之间用 ACCOUNT_SEPARATOR（8 个破折号）
+    - 模块返回空内容时写「（无输出）」，不让那一块凭空消失
+    """
+    items = list(accounts or [])
+    if not items:
+        return ""
+    multi = len(items) > 1
+    blocks = []
+    for index, one in enumerate(items, 1):
+        raw = str((one or {}).get("text") or "").strip()
+        module_id, body = _split_account_info(raw)
+        hint = str((one or {}).get("hint") or "").strip()
+        label = module_id or hint or (f"第 {index} 个账号" if multi else "—")
+        blocks.append(f"「{name}」\n账号信息: {label}\n{body or '（无输出）'}")
+    return ACCOUNT_SEPARATOR.join(blocks)
+
+
+def render_content(blocks: list, title: str = "") -> str:
+    """把各站点结果渲染成**一条**消息正文（纯字符串处理，便于单测）。
+
+    - 标题单独一行，与正文之间空一行
+    - 站点之间用分隔行 SEPARATOR 隔开
+    - 空区块直接丢掉，不会产生空行
+    """
+    parts = [str(one).strip() for one in blocks if str(one or "").strip()]
+    body = SITE_SEPARATOR.join(parts)
+    if not title:
+        return body
+    return f"【{title}】\n\n{body}" if body else f"【{title}】"
+
+
+def message2server(sckey, content, title=NOTICE_TITLE):
+    print("server 酱推送开始")
+    data = {"text": title, "desp": content.replace("\n", "\n\n")}
+    requests.post(url=f"https://sc.ftqq.com/{sckey}.send", data=data)
+
+
+def message2server_turbo(sendkey, content, title=NOTICE_TITLE):
+    data = {"text": title, "desp": content.replace("\n", "\n\n")}
+    if match := re.match(r"^sctp(\d+)t", sendkey):
+        sc3uid = match.group(1)
+        print("Server 酱³ 推送开始")
+        url = f"https://{sc3uid}.push.ft07.com/send/{sendkey}.send?tags=DailyCheckin"
+    else:
+        print("server 酱 Turbo 推送开始")
+        url = f"https://sctapi.ftqq.com/{sendkey}.send"
+    requests.post(url=url, data=data)
+
+
+def message2coolpush(
+    coolpushskey,
+    content,
+    coolpushqq: bool = True,
+    coolpushwx: bool = False,
+    coolpushemail: bool = False,
+):
+    print("Cool Push 推送开始")
+    params = {"c": content, "t": "每日签到"}
+    if coolpushqq:
+        requests.post(url=f"https://push.xuthus.cc/send/{coolpushskey}", params=params)
+    if coolpushwx:
+        requests.post(url=f"https://push.xuthus.cc/wx/{coolpushskey}", params=params)
+    if coolpushemail:
+        requests.post(url=f"https://push.xuthus.cc/email/{coolpushskey}", params=params)
+
+
+def message2qmsg(qmsg_key, qmsg_type, content):
+    print("qmsg 酱推送开始")
+    params = {"msg": content}
+    if qmsg_type == "group":
+        requests.get(url=f"https://qmsg.zendee.cn/group/{qmsg_key}", params=params)
+    else:
+        requests.get(url=f"https://qmsg.zendee.cn/send/{qmsg_key}", params=params)
+
+
+def message2telegram(tg_api_host, tg_proxy, tg_bot_token, tg_user_id, content):
+    print("Telegram 推送开始")
+    send_data = {
+        "chat_id": tg_user_id,
+        "text": content,
+        "disable_web_page_preview": "true",
+    }
+    if tg_api_host:
+        url = f"https://{tg_api_host}/bot{tg_bot_token}/sendMessage"
+    else:
+        url = f"https://api.telegram.org/bot{tg_bot_token}/sendMessage"
+    if tg_proxy:
+        proxies = {
+            "http": tg_proxy,
+            "https": tg_proxy,
+        }
+    else:
+        proxies = None
+    requests.post(url=url, data=send_data, proxies=proxies)
+
+
+def message2feishu(fskey, content):
+    print("飞书 推送开始")
+    data = {"msg_type": "text", "content": {"text": content}}
+    requests.post(url=f"https://open.feishu.cn/open-apis/bot/v2/hook/{fskey}", json=data)
+
+
+def message2dingtalk(dingtalk_secret, dingtalk_access_token, content):
+    print("Dingtalk 推送开始")
+    timestamp = str(round(time.time() * 1000))
+    secret_enc = dingtalk_secret.encode("utf-8")
+    string_to_sign = f"{timestamp}\n{dingtalk_secret}"
+    string_to_sign_enc = string_to_sign.encode("utf-8")
+    hmac_code = hmac.new(secret_enc, string_to_sign_enc, digestmod=hashlib.sha256).digest()
+    sign = quote_plus(base64.b64encode(hmac_code))
+    send_data = {"msgtype": "text", "text": {"content": content}}
+    requests.post(
+        url=f"https://oapi.dingtalk.com/robot/send?access_token={dingtalk_access_token}&timestamp={timestamp}&sign={sign}",
+        headers={"Content-Type": "application/json", "Charset": "UTF-8"},
+        data=json.dumps(send_data),
+    )
+
+
+def message2bark(bark_url: str, content):
+    print("Bark 推送开始")
+    if not bark_url.endswith("/"):
+        bark_url += "/"
+    content = quote_plus(content)
+    url = f"{bark_url}{content}"
+    headers = {"Content-type": "application/x-www-form-urlencoded"}
+    requests.get(url=url, headers=headers)
+
+
+def message2qywxrobot(qywx_key, content):
+    print("企业微信群机器人推送开始")
+    requests.post(
+        url=f"https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key={qywx_key}",
+        data=json.dumps({"msgtype": "text", "text": {"content": content}}),
+    )
+
+
+def message2qywxapp(
+    qywx_corpid,
+    qywx_agentid,
+    qywx_corpsecret,
+    qywx_touser,
+    qywx_media_id,
+    qywx_origin,
+    content,
+    title=NOTICE_TITLE,
+):
+    print("企业微信应用消息推送开始")
+    base_url = "https://qyapi.weixin.qq.com"
+    if qywx_origin:
+        base_url = qywx_origin
+    res = requests.get(f"{base_url}/cgi-bin/gettoken?corpid={qywx_corpid}&corpsecret={qywx_corpsecret}")
+    token = res.json().get("access_token", False)
+    if qywx_media_id:
+        data = {
+            "touser": qywx_touser,
+            "msgtype": "mpnews",
+            "agentid": int(qywx_agentid),
+            "mpnews": {
+                "articles": [
+                    {
+                        "title": title,
+                        "thumb_media_id": qywx_media_id,
+                        "author": PROJECT_NAME,
+                        "content_source_url": PROJECT_URL,
+                        "content": content.replace("\n", "<br>"),
+                        "digest": content,
+                    }
+                ]
+            },
+        }
+    else:
+        data = {
+            "touser": qywx_touser,
+            "agentid": int(qywx_agentid),
+            "msgtype": "textcard",
+            "textcard": {
+                "title": title,
+                "description": content,
+                "url": PROJECT_URL,
+                "btntxt": "开源项目",
+            },
+        }
+    requests.post(
+        url=f"{base_url}/cgi-bin/message/send?access_token={token}",
+        data=json.dumps(data),
+    )
+
+
+def message2pushplus(pushplus_token, content, pushplus_topic=None, title=NOTICE_TITLE):
+    print("Pushplus 推送开始")
+    data = {
+        "token": pushplus_token,
+        "title": title,
+        "content": content.replace("\n", "<br>"),
+        "template": "json",
+    }
+    if pushplus_topic:
+        data["topic"] = pushplus_topic
+    requests.post(url="http://www.pushplus.plus/send", data=json.dumps(data))
+
+
+def message2gotify(
+    gotify_url: str,
+    gotify_token: str,
+    gotify_priority: str,
+    content: str,
+    title: str = NOTICE_TITLE,
+) -> None:
+    print("Gotify 服务启动")
+    if not gotify_priority:
+        gotify_priority = "3"
+    url = f"{gotify_url}/message?token={gotify_token}"
+    data = {
+        "title": title,
+        "message": content,
+        "priority": gotify_priority,
+    }
+    response = requests.post(url, data=data).json()
+
+    if response.get("id"):
+        print("Gotify 推送成功！")
+    else:
+        print("Gotify 推送失败！")
+
+
+def message2ntfy(
+    ntfy_url: str,
+    ntfy_topic: str,
+    ntfy_priority: str,
+    content: str,
+    title: str = NOTICE_TITLE,
+) -> None:
+    def encode_rfc2047(text: str) -> str:
+        """将文本编码为符合 RFC 2047 标准的格式"""
+        encoded_bytes = base64.b64encode(text.encode("utf-8"))
+        encoded_str = encoded_bytes.decode("utf-8")
+        return f"=?utf-8?B?{encoded_str}?="
+
+    print("Ntfy 服务启动")
+    if not ntfy_url:
+        ntfy_url = "https://ntfy.sh"
+    if not ntfy_priority:
+        ntfy_priority = "3"
+    # 使用 RFC 2047 编码 title
+    encoded_title = encode_rfc2047(title)
+
+    data = content.encode(encoding="utf-8")
+    headers = {"Title": encoded_title, "Priority": ntfy_priority}  # 使用编码后的 title
+    url = f"{ntfy_url}/{ntfy_topic}"
+    response = requests.post(url, data=data, headers=headers)
+    if response.status_code == 200:  # 使用 response.status_code 进行检查
+        print("Ntfy 推送成功！")
+    else:
+        print("Ntfy 推送失败！错误信息：", response.text)
+
+
+def important_notice():
+    datas = requests.get(
+        url="https://api.github.com/repos/Sitoi/dailycheckin/issues?state=open&labels=通知",
+        timeout=15,
+    ).json()
+    if datas:
+        data = datas[0]
+        title = data.get("title")
+        body = data.get("body")
+        url = data.get("html_url")
+        notice = f"{title}\n{body}\n详细地址: {url}"
+    else:
+        notice = None
+    return notice
+
+
+def push_message(content_list: list, notice_info: dict, title: str = NOTICE_TITLE):
+    dingtalk_secret = notice_info.get("dingtalk_secret")
+    dingtalk_access_token = notice_info.get("dingtalk_access_token")
+    fskey = notice_info.get("fskey")
+    bark_url = notice_info.get("bark_url")
+    sckey = notice_info.get("sckey")
+    sendkey = notice_info.get("sendkey")
+    qmsg_key = notice_info.get("qmsg_key")
+    qmsg_type = notice_info.get("qmsg_type")
+    tg_bot_token = notice_info.get("tg_bot_token")
+    tg_user_id = notice_info.get("tg_user_id")
+    tg_api_host = notice_info.get("tg_api_host")
+    tg_proxy = notice_info.get("tg_proxy")
+    coolpushskey = notice_info.get("coolpushskey")
+    coolpushqq = notice_info.get("coolpushqq")
+    coolpushwx = notice_info.get("coolpushwx")
+    coolpushemail = notice_info.get("coolpushemail")
+    qywx_key = notice_info.get("qywx_key")
+    qywx_corpid = notice_info.get("qywx_corpid")
+    qywx_agentid = notice_info.get("qywx_agentid")
+    qywx_corpsecret = notice_info.get("qywx_corpsecret")
+    qywx_touser = notice_info.get("qywx_touser")
+    qywx_media_id = notice_info.get("qywx_media_id")
+    qywx_origin = notice_info.get("qywx_origin")
+    pushplus_token = notice_info.get("pushplus_token")
+    pushplus_topic = notice_info.get("pushplus_topic")
+    gotify_url = notice_info.get("gotify_url")
+    gotify_token = notice_info.get("gotify_token")
+    gotify_priority = notice_info.get("gotify_priority")
+    ntfy_url = notice_info.get("ntfy_url")
+    ntfy_topic = notice_info.get("ntfy_topic")
+    ntfy_priority = notice_info.get("ntfy_priority")
+
+    blocks = [one for one in content_list if str(one or "").strip()]
+    try:
+        notice = important_notice()
+        if notice:
+            blocks.append(notice)
+    except Exception as e:
+        print("获取重要通知失败:", e)
+
+    # 一次任务**只发一条**：所有站点结果拼在一条消息里，中间用分隔行隔开。
+    # 上游那套「按渠道自动拆成多条 + MERGE_PUSH 开关」已经删掉——它既容易在
+    # 配置留白时误判，也会让同一批结果散成好几条，读起来反而更累。
+    # 这里保留「列表 + 循环」只是为了将来真要拆分时只改这一行，
+    # 不必把下面上百行的推送代码整体重新缩进。
+    content_str = render_content(blocks, title=title)
+    message_list = [content_str]
+    for message in message_list:
+        if qmsg_key:
+            try:
+                message2qmsg(qmsg_key=qmsg_key, qmsg_type=qmsg_type, content=message)
+            except Exception as e:
+                print("qmsg 推送失败", e)
+        if coolpushskey:
+            try:
+                message2coolpush(
+                    coolpushskey=coolpushskey,
+                    coolpushqq=coolpushqq,
+                    coolpushwx=coolpushwx,
+                    coolpushemail=coolpushemail,
+                    content=message,
+                )
+            except Exception as e:
+                print("coolpush 推送失败", e)
+        if qywx_touser and qywx_corpid and qywx_corpsecret and qywx_agentid:
+            try:
+                message2qywxapp(
+                    qywx_corpid=qywx_corpid,
+                    qywx_agentid=qywx_agentid,
+                    qywx_corpsecret=qywx_corpsecret,
+                    qywx_touser=qywx_touser,
+                    qywx_media_id=qywx_media_id,
+                    qywx_origin=qywx_origin,
+                    content=message,
+                    title=title,
+                )
+            except Exception as e:
+                print("企业微信应用消息推送失败", e)
+        if bark_url:
+            try:
+                message2bark(bark_url=bark_url, content=message)
+            except Exception as e:
+                print("Bark 推送失败", e)
+        if dingtalk_access_token and dingtalk_secret:
+            try:
+                message2dingtalk(
+                    dingtalk_secret=dingtalk_secret,
+                    dingtalk_access_token=dingtalk_access_token,
+                    content=message,
+                )
+            except Exception as e:
+                print("钉钉推送失败", e)
+        if fskey:
+            try:
+                message2feishu(fskey=fskey, content=message)
+            except Exception as e:
+                print("飞书推送失败", e)
+        if sckey:
+            try:
+                message2server(sckey=sckey, content=message, title=title)
+            except Exception as e:
+                print("Server 推送失败", e)
+        if sendkey:
+            try:
+                message2server_turbo(sendkey=sendkey, content=message, title=title)
+            except Exception as e:
+                print("Server Turbo 推送失败", e)
+        if qywx_key:
+            try:
+                message2qywxrobot(qywx_key=qywx_key, content=message)
+            except Exception as e:
+                print("企业微信群机器人推送失败", e)
+        if pushplus_token:
+            try:
+                message2pushplus(
+                    pushplus_token=pushplus_token,
+                    content=message,
+                    pushplus_topic=pushplus_topic,
+                    title=title,
+                )
+            except Exception as e:
+                print("Pushplus 推送失败", e)
+        if tg_user_id and tg_bot_token:
+            try:
+                message2telegram(
+                    tg_api_host=tg_api_host,
+                    tg_proxy=tg_proxy,
+                    tg_user_id=tg_user_id,
+                    tg_bot_token=tg_bot_token,
+                    content=message,
+                )
+            except Exception as e:
+                print("Telegram 推送失败", e)
+        if gotify_url and gotify_token:
+            try:
+                message2gotify(
+                    gotify_url=gotify_url,
+                    gotify_token=gotify_token,
+                    gotify_priority=gotify_priority,
+                    content=message,
+                    title=title,
+                )
+            except Exception as e:
+                print("Gotify 推送失败", e)
+        if ntfy_topic:
+            try:
+                message2ntfy(
+                    ntfy_url=ntfy_url,
+                    ntfy_topic=ntfy_topic,
+                    ntfy_priority=ntfy_priority,
+                    content=message,
+                    title=title,
+                )
+            except Exception as e:
+                print("Ntfy 推送失败", e)
+
+
+if __name__ == "__main__":
+    print(important_notice())

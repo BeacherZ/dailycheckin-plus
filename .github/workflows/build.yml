@@ -1,0 +1,361 @@
+name: build & publish
+
+# 推 main → 冒烟测试 + 发布镜像到 ghcr.io
+# 提 PR   → 只跑冒烟测试，不发布
+# 打 tag  → 冒烟测试 + 发布带版本号的镜像
+#
+# **只改文档不重建镜像**：README / LICENSE / 截图 / compose 示例这类改动碰不到镜像里
+# 任何有用的东西，却会白跑四分钟、白推一个 digest 不同的 latest，用户 `docker pull`
+# 一次几百 MB 换回一份和上一版一模一样的镜像。所以 main 分支的推送按 paths-ignore 过滤掉它们。
+#
+# 注意 paths-ignore **对 tag 推送不生效**（官方文档："Path filters are not evaluated
+# for pushes of tags."），也就是说打了 tag 一定会构建 —— 发版流程不受影响。
+# PR 事件故意不加过滤：一旦因路径过滤被跳过，与 workflow 同名的必需检查会一直挂在
+# Pending，改文档的 PR 反而永远合不进去（PR 上本来也不会发布镜像，白跑无害）。
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - "LICENSE"
+      - "index.png"
+      # compose 只是部署示例，不参与运行时：改个端口注释不该惊动任何人。
+      - "docker-compose*.yml"
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  # ------------------------------------------------------------------ #
+  # 1) 构建镜像、起容器、把所有接口真跑一遍
+  # ------------------------------------------------------------------ #
+  smoke:
+    name: 构建镜像并冒烟测试
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 上游 tarball 里部分文件带可执行位。同步引擎时若没归一化，git 会记录一堆
+      # 「内容一个字没改、只有 mode 从 100644 变 100755」的假改动（Windows 上发现不了），
+      # 还会让 sync 工作流每次白提交一次。这里把它钉死。
+      - name: 引擎文件权限位检查（不许有可执行位）
+        run: |
+          set -e
+          bad=$(git ls-files -s dailycheckin_plus | awk '$1 != "100644" {print $1, $4}')
+          if [ -n "$bad" ]; then
+            echo "以下文件权限位不是 100644："
+            echo "$bad"
+            exit 1
+          fi
+          echo "dailycheckin_plus/ 下 $(git ls-files dailycheckin_plus | wc -l) 个文件权限位正常"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: 计算构建溯源
+        id: stamp
+        run: |
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "date=$(git log -1 --format=%cI)" >> "$GITHUB_OUTPUT"
+
+      - name: 构建镜像（Dockerfile 内含引擎自检，装不上会直接失败）
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          push: false
+          tags: dailycheckin-plus:ci
+          build-args: |
+            GIT_COMMIT=${{ steps.stamp.outputs.sha }}
+            GIT_DATE=${{ steps.stamp.outputs.date }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: 启动容器并等待面板就绪
+        run: |
+          mkdir -p config cron logs data
+          docker run -d --name dc-ci -p 18080:8080 \
+            -e PANEL_PORT=8080 -e PANEL_TOKEN=ci-secret \
+            -v "$PWD/config:/dailycheckin-plus/config" \
+            -v "$PWD/cron:/dailycheckin-plus/cron" \
+            -v "$PWD/logs:/dailycheckin-plus/logs" \
+            -v "$PWD/data:/dailycheckin-plus/data" \
+            dailycheckin-plus:ci
+          for i in $(seq 1 40); do
+            if curl -fsS -H "X-Panel-Token: ci-secret" http://127.0.0.1:18080/api/health >/dev/null; then
+              echo "面板已就绪（第 $i 次探测）"; break
+            fi
+            sleep 2
+          done
+
+      - name: 首次启动是否自动生成了配置与定时任务
+        run: |
+          set -e
+          test -s config/config.json || { echo "config.json 未生成"; exit 1; }
+          test -s cron/crontab_list.sh || { echo "crontab_list.sh 未生成"; exit 1; }
+          echo "--- 生成的 config.json 前几行"
+          head -5 config/config.json
+          echo "--- crontab 内容"
+          docker exec dc-ci crontab -l | tee /tmp/cron.txt
+          grep -q "dailycheckin-plus managed" /tmp/cron.txt
+
+      - name: 健康检查与口令保护
+        run: |
+          set -e
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18080/api/state)
+          test "$code" = "401" || { echo "无口令应返回 401，实际 $code"; exit 1; }
+          curl -fsS -H "X-Panel-Token: ci-secret" http://127.0.0.1:18080/api/state -o state.json
+          curl -fsS http://127.0.0.1:18080/ | grep -q "dailycheckin-plus"
+          curl -fsS http://127.0.0.1:18080/static/app.js > /dev/null
+          curl -fsS http://127.0.0.1:18080/api/auth/status -o auth-status.json
+          # 版本号只有 panel/version.py 一处，engine 里**没有** version 了（脱钩后那号没意义）
+          python3 -c "import json;st=json.load(open('state.json',encoding='utf-8'));assert st['panel']['token_bypass'] is True,st['panel'];assert st['engine']['ok'] is True,st['engine'];assert 'version' not in st['engine'],st['engine'];assert len(st['sites'])>=16,len(st['sites']);print('版本',st['panel']['version'],'| 站点数',len(st['sites']))"
+          python3 -c "import json;a=json.load(open('auth-status.json',encoding='utf-8'));assert a['initialized'] is False,a;print('账号初始状态：未设置')"
+
+      - name: 后台账号密码（首次设置 → 登录 → 登出 → 改密码）
+        run: |
+          set -e
+          B=http://127.0.0.1:18080
+
+          # 未设置账号时，无凭证的受保护接口要 401 + need_setup
+          # 注意：这里不能用 -f，否则 401 的响应体不会被写下来
+          curl -s $B/api/state -o needsetup.json
+          python3 -c "import json;d=json.load(open('needsetup.json'));assert d.get('need_setup') is True,d;print('未设置账号时的提示 OK')"
+
+          # 校验规则：密码过短要拒绝
+          code=$(curl -s -o /dev/null -w '%{http_code}' -H "Content-Type: application/json" \
+            -d '{"username":"admin","password":"123"}' $B/api/auth/setup)
+          test "$code" = "400" || { echo "短密码应 400，实际 $code"; exit 1; }
+
+          # 首次设置：成功后下发会话 cookie
+          curl -fsS -c cookies.txt -H "Content-Type: application/json" \
+            -d '{"username":"admin","password":"ci-pass-123"}' $B/api/auth/setup -o setup.json
+          python3 -c "import json;d=json.load(open('setup.json'));assert d['ok'] is True,d;print('首次设置 OK')"
+          grep -q dc_session cookies.txt || { echo "未下发会话 cookie"; exit 1; }
+
+          # 只带会话 cookie（不带 token）也要能访问
+          curl -fsS -b cookies.txt $B/api/state -o sess.json
+          python3 -c "import json;d=json.load(open('sess.json'));assert d['panel']['user']=='admin',d['panel'];print('会话可访问受保护接口 OK')"
+
+          # 重复设置要被拒绝
+          code=$(curl -s -o /dev/null -w '%{http_code}' -H "Content-Type: application/json" \
+            -d '{"username":"hacker","password":"ci-pass-123"}' $B/api/auth/setup)
+          test "$code" = "400" || { echo "重复设置应 400，实际 $code"; exit 1; }
+
+          # 登出后必须重新登录
+          curl -fsS -b cookies.txt -c cookies.txt -X POST $B/api/auth/logout -o /dev/null
+          curl -s $B/api/state -o after.json
+          python3 -c "import json;d=json.load(open('after.json'));assert d.get('need_login') is True,d;print('登出后拦截 OK')"
+
+          # 错误密码 401，正确密码 200
+          code=$(curl -s -o /dev/null -w '%{http_code}' -H "Content-Type: application/json" \
+            -d '{"username":"admin","password":"nope"}' $B/api/auth/login)
+          test "$code" = "401" || { echo "错误密码应 401，实际 $code"; exit 1; }
+          curl -fsS -c cookies.txt -H "Content-Type: application/json" \
+            -d '{"username":"admin","password":"ci-pass-123"}' $B/api/auth/login -o /dev/null
+
+          # 改密码：旧密码失效、新密码可用
+          curl -fsS -b cookies.txt -c cookies.txt -H "Content-Type: application/json" \
+            -d '{"old_password":"ci-pass-123","new_password":"ci-pass-456"}' $B/api/auth/credentials -o cred.json
+          python3 -c "import json;d=json.load(open('cred.json'));assert d['password_changed'] is True,d;print('改密码 OK')"
+          code=$(curl -s -o /dev/null -w '%{http_code}' -H "Content-Type: application/json" \
+            -d '{"username":"admin","password":"ci-pass-123"}' $B/api/auth/login)
+          test "$code" = "401" || { echo "旧密码应失效，实际 $code"; exit 1; }
+          code=$(curl -s -o /dev/null -w '%{http_code}' -H "Content-Type: application/json" \
+            -d '{"username":"admin","password":"ci-pass-456"}' $B/api/auth/login)
+          test "$code" = "200" || { echo "新密码应可登录，实际 $code"; exit 1; }
+          echo "认证流程全部通过"
+
+      - name: cookie 规范化接口
+        run: |
+          curl -fsS -H "X-Panel-Token: ci-secret" -H "Content-Type: application/json" \
+            -d '{"raw":"SESSDATA=abc;bili_jct=def","site":"BILIBILI"}' \
+            http://127.0.0.1:18080/api/cookies/normalize -o norm.json
+          python3 -c "import json;r=json.load(open('norm.json',encoding='utf-8'));assert r['ok'] is True,r;assert r['cookie']=='SESSDATA=abc; bili_jct=def;',r['cookie'];assert r['count']==2,r;print('规范化结果:',r['cookie'])"
+
+      # 引擎自 2026-10-19 起与本项目一体化（不再有上游同步、不再有补丁），
+      # 所以这里锁两件事：① 引擎里那些**有意为之**的改造还在（防止被人整目录覆盖回去）；
+      # ② 两个本项目新增的站点真的被引擎加载了。
+      - name: 引擎与站点模块（离线校验）
+        run: |
+          set -e
+          echo "--- 通知模块自测：恒定一条、标题带项目名、结尾是本项目地址"
+          python3 tools/test_notice.py
+          echo "--- crontab 托管区块自测：老项目名标记要认、要能升级，且不能变成两段任务"
+          python3 tools/test_schedule.py
+          echo "--- 前端契约自测：首屏不预置登录屏、默认已配置优先、卡片 4 列 / 列表 2 列"
+          python3 tools/test_panel_static.py
+          echo "--- 定时校验自测：cron 算法、只在失效时通知、同一批失效 24 小时内不重复"
+          python3 tools/test_autoverify.py
+          echo "--- 站点元数据与面板接线：必填字段、下拉枚举、cookie 告警、脱钩状态"
+          python3 tools/test_sites.py
+          echo "--- NodeSeek 自测：随机/固定两种方式、已签到按 body 判定"
+          python3 tools/test_nodeseek.py
+          echo "--- 微博超话自测：卡片解析、超话名匹配、风控与已签到分支"
+          python3 tools/test_weibo.py
+          echo "--- 在线校验器自测：账号密码本站点试登录、NodeSeek 200+JSON 判有效、CF 挑战页不误判失效"
+          python3 tools/test_verify.py
+          echo "--- 版本自测：全项目只有一个版本号、检查更新只比版本号不比提交"
+          python3 tools/test_version.py
+          echo "--- UPSTREAM.json：fork 来源与脱钩时间"
+          python3 -c "import json;s=json.load(open('UPSTREAM.json',encoding='utf-8'));print('fork 自',s['repo'],'@',s['version'],s['commit'][:10],'| 脱钩于',s['detached_at'],'| 引擎站点',len(s['engine_sites']),'个');assert s['commit'] and s['detached_at'] and s['engine_sites'];assert 'patches' not in s,'UPSTREAM.json 里不该再有 patches 字段'"
+          echo "--- 引擎里本项目自己的改造必须还在"
+          python3 -c "import pathlib as p;b=p.Path('dailycheckin_plus/bilibili/main.py').read_text(encoding='utf-8');m=p.Path('dailycheckin_plus/utils/message.py').read_text(encoding='utf-8');n=p.Path('dailycheckin_plus/main.py').read_text(encoding='utf-8');assert 'web-interface/newlist' in b,'B 站分区接口没修';assert 'render_content' in m and 'SEPARATOR' in m,'通知单条逻辑丢了';assert 'merge_push' not in m,'通知模块里还留着会拆成多条的旧逻辑';assert 'PROJECT_URL' in n and 'Sitoi/dailycheckin\"' not in n,'main.py 的引擎元信息没跟上';assert 'dailycheckin-plus' in m and 'PROJECT_NAME' in n,'项目名没落到引擎里';print('引擎改造完好')"
+          echo "--- 两个本项目新增的站点能在引擎目录里被发现（扫目录，不 import：宿主机没装引擎依赖，i茅台要 pycryptodome）"
+          python3 -c "import pathlib as p;root=p.Path('dailycheckin_plus');mods=sorted(d.name for d in root.iterdir() if (d/'main.py').exists());assert 'nodeseek' in mods and 'weibo' in mods,mods;assert 'aolaxing' not in mods and 'baidu' not in mods,mods;print('站点模块',len(mods),'个:',', '.join(mods))"
+
+      - name: 面板能看到引擎来源，且没有站点缺元数据
+        run: |
+          set -e
+          curl -fsS -H "X-Panel-Token: ci-secret" http://127.0.0.1:18080/api/state -o state-src.json
+          python3 -c "import json;st=json.load(open('state-src.json',encoding='utf-8'));up=st['engine']['upstream'];print('面板显示的引擎来源:',up['repo'],up['ref'],up['commit'],'| 脱钩于',up['detached_at']);assert up['commit'],up;assert up['detached_at'],up;assert 'patches' not in up,up;assert st['engine']['sites_without_meta']==[],st['engine']['sites_without_meta'];print('所有站点都有元数据')"
+
+
+      - name: 推送通知按渠道分组，且分组没有漏键
+        run: |
+          set -e
+          curl -fsS -H "X-Panel-Token: ci-secret" http://127.0.0.1:18080/api/state -o state-notice.json
+          python3 -c "import json;st=json.load(open('state-notice.json',encoding='utf-8'));g=st['notice_groups'];k=[f['key'] for x in g for f in x['fields']];assert len(g)==11,len(g);assert k==[i['key'] for i in st['notice_keys']],'分组后的键必须与扁平列表一字不差';assert len(set(k))==27,len(k);assert sum(1 for x in g if x['wide'])==1,'整行铺开的组只该有企业微信';assert all(f['label'] and f['full'] for x in g for f in x['fields']);print('推送通知分组:','、'.join('%s(%d)'%(x['name'],len(x['fields'])) for x in g))"
+
+      - name: 定时校验：接口在、默认每 6 小时、非法 cron 被拒
+        run: |
+          set -e
+          B=http://127.0.0.1:18080
+          curl -fsS -H "X-Panel-Token: ci-secret" $B/api/verify-schedule -o vs.json
+          python3 -c "import json;v=json.load(open('vs.json',encoding='utf-8'));assert v['cron']=='0 */6 * * *',v;assert v['enabled'] and v['notify'],v;assert v['presets'],v;print('定时校验默认:',v['cron'],'| 预设',len(v['presets']),'项')"
+          curl -fsS -H "X-Panel-Token: ci-secret" -H "Content-Type: application/json" \
+            -X PUT -d '{"enabled":true,"cron":"0 */12 * * *","notify":true}' $B/api/verify-schedule -o vs2.json
+          python3 -c "import json,time;v=json.load(open('vs2.json',encoding='utf-8'));assert v['cron']=='0 */12 * * *',v;assert v['next_run_at']>time.time(),v;print('下次校验:',time.strftime('%Y-%m-%d %H:%M',time.localtime(v['next_run_at'])))"
+          code=$(curl -s -o /dev/null -w '%{http_code}' -H "X-Panel-Token: ci-secret" -H "Content-Type: application/json" \
+            -X PUT -d '{"enabled":true,"cron":"0 99 * * *","notify":true}' $B/api/verify-schedule)
+          test "$code" = "400" || { echo "非法 cron 没被拒绝，返回 $code"; exit 1; }
+          echo "非法 cron 已拒绝（400）"
+
+      - name: 「关于本项目」的更新检查：构建溯源 + /api/update 不会把面板拖垮
+        run: |
+          set -e
+          python3 -c "import json;u=json.load(open('state-notice.json',encoding='utf-8'))['update'];print('构建溯源:',u['version'],u['short'],u['date']);assert u['repo'] and u['url'].startswith('https://github.com/'),u;assert u['commit'],'镜像里没生成 PANEL_BUILD.json: %s'%u"
+          # 镜像里记录的提交必须就是这次构建的提交 —— 不然面板会一直喊「有新版本」。
+          # 用 Python 断言而不是 bash 的 test "$(docker exec ...)"：嵌套引号里再塞
+          # 引号太容易写错（\" 在单引号里是字面量，传给 Python 直接语法错），
+          # 而且断言失败时能把这个值打出来。
+          docker exec dc-ci python -c "import panel.update as u;c=u.build_stamp()['commit'];e='${{ steps.stamp.outputs.sha }}';print('镜像内构建提交', c[:10], '期望', e[:10]);assert c==e,(c,e)"
+          # /api/update 会真去问 GitHub。这里只要求「不管成功失败都回 200 + 结构化结论」——
+          # 网络抖一下就变红的话，这个 job 以后没人敢信。
+          code=$(curl -s -o upd.json -w '%{http_code}' -H "X-Panel-Token: ci-secret" http://127.0.0.1:18080/api/update)
+          test "$code" = "200"
+          python3 -c "import json;d=json.load(open('upd.json'));print('更新检查: ok=%s needs_update=%s %s'%(d['ok'],d['needs_update'],d['error'] or (d['remote'] or {}).get('short','')));assert d['ok'] in (True,False) and 'needs_update' in d"
+
+      - name: 引擎加载与 B 站接口修复
+        run: |
+          set -e
+          docker exec dc-ci python -c "import dailycheckin_plus, dailycheckin_plus.configs as c; assert len(c.checkin_map) >= 16; print('站点模块:', len(c.checkin_map))"
+          docker exec dc-ci sh -c "grep -c 'web-interface/newlist' \$(python -c 'import dailycheckin_plus.bilibili.main as m; print(m.__file__)')"
+          docker exec dc-ci dailycheckin-plus --include BILIBILI
+
+      - name: 跑一次真实签到流程（接入一个假 cookie）
+        run: |
+          set -e
+          # 注意：config 是 bind mount，容器内是 root 写的，宿主机用户改不动，
+          # 所以这个文件必须在容器里写。
+          docker exec dc-ci python -c "import json;json.dump({'BILIBILI':[{'cookie':'SESSDATA=fake; bili_jct=fake; DedeUserID=1','coin_num':0}]},open('/dailycheckin-plus/config/config.json','w'),ensure_ascii=False)"
+          curl -fsS -H "X-Panel-Token: ci-secret" -H "Content-Type: application/json" \
+            -d '{"sites":["BILIBILI"]}' http://127.0.0.1:18080/api/run -o run.json
+          RUN_ID=$(python3 -c "import json;print(json.load(open('run.json'))['id'])")
+          for i in $(seq 1 60); do
+            curl -fsS -H "X-Panel-Token: ci-secret" "http://127.0.0.1:18080/api/runs/$RUN_ID" -o detail.json
+            status=$(python3 -c "import json;print(json.load(open('detail.json'))['status'])")
+            [ "$status" != "running" ] && break
+            sleep 2
+          done
+          python3 -c "import json;d=json.load(open('detail.json',encoding='utf-8'));print('\n'.join(d['lines'][:25]));print('状态:',d['status']);assert d['status']!='running'"
+          echo "--- 面板回写的状态"
+          curl -fsS -H "X-Panel-Token: ci-secret" http://127.0.0.1:18080/api/state -o state2.json
+          python3 -c "import json;st=json.load(open('state2.json',encoding='utf-8'));s=[x for x in st['sites'] if x['key']=='BILIBILI'][0];print('BILIBILI ->',s['status']['state'],'|',s['status']['message']);assert s['status']['state'] in ('valid','invalid');assert s['status']['source']=='run',s['status']"
+
+      - name: 改动 cookie 后旧的有效性标记必须作废
+        run: |
+          set -e
+          # 换成另一个 cookie，面板要把该站点状态重置为 unverified，否则用户会看到过期的 ❌/✅
+          curl -fsS -H "X-Panel-Token: ci-secret" -H "Content-Type: application/json" \
+            -d '{"accounts":[{"cookie":"SESSDATA=fake2; bili_jct=fake2; DedeUserID=2","coin_num":0}]}' \
+            http://127.0.0.1:18080/api/sites/BILIBILI/accounts -o save.json
+          python3 -c "import json;r=json.load(open('save.json',encoding='utf-8'));print('保存返回:',r);assert r['ok'] is True and r['changed'] is True,r"
+          curl -fsS -H "X-Panel-Token: ci-secret" http://127.0.0.1:18080/api/state -o state3.json
+          python3 -c "import json;st=json.load(open('state3.json',encoding='utf-8'));s=[x for x in st['sites'] if x['key']=='BILIBILI'][0];print('BILIBILI ->',s['status']);assert s['status']['state']=='unverified',s['status'];assert not s['status']['source'],s['status']"
+          # 再存一次同样的内容，changed 应为 false（不该无谓地清空状态）
+          curl -fsS -H "X-Panel-Token: ci-secret" -H "Content-Type: application/json" \
+            -d '{"accounts":[{"cookie":"SESSDATA=fake2; bili_jct=fake2; DedeUserID=2","coin_num":0}]}' \
+            http://127.0.0.1:18080/api/sites/BILIBILI/accounts -o save2.json
+          python3 -c "import json;r=json.load(open('save2.json',encoding='utf-8'));print('重复保存返回:',r);assert r['changed'] is False,r"
+
+      - name: 失败时打印容器日志
+        if: failure()
+        run: |
+          docker logs dc-ci --tail 200
+          docker ps -a
+
+  # ------------------------------------------------------------------ #
+  # 2) 冒烟测试通过后，把镜像发布到 ghcr.io
+  # ------------------------------------------------------------------ #
+  publish:
+    name: 发布镜像到 GHCR
+    needs: smoke
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # 设置页「关于本项目」的「当前容器要不要更新」就是拿这个提交去跟镜像里的比。
+      # 不用 github.sha 是有原因的：它在这里等于「这次构建从哪 checkout」，
+      # 而 git rev-parse HEAD 拿到的是工作区真实提交，两者一般一样、但后者更直接。
+      - name: 计算构建溯源
+        id: stamp
+        run: |
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "date=$(git log -1 --format=%cI)" >> "$GITHUB_OUTPUT"
+          echo "ver=$(python3 tools/version.py)" >> "$GITHUB_OUTPUT"
+
+      - name: 登录 GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 计算镜像标签
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          # 版本只有一个来源：panel/version.py。发版就打 tag vX.Y.Z 推上来，
+          # 镜像会同时挂 2.2.0（semver）、v2.2.0（tag 名）、latest 和短 sha。
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=semver,pattern={{version}}
+            type=ref,event=tag
+            type=sha,format=short
+
+      - name: 构建并推送
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          # metadata-action 的 org.opencontainers.image.version 在 main 构建里是字面量
+          # "latest"，没法当版本号用；再挂一个自己的标签，面板据此显示「远端是什么版本」。
+          labels: |
+            ${{ steps.meta.outputs.labels }}
+            cn.dailycheckin-plus.version=${{ steps.stamp.outputs.ver }}
+            cn.dailycheckin.version=${{ steps.stamp.outputs.ver }}
+          build-args: |
+            GIT_COMMIT=${{ steps.stamp.outputs.sha }}
+            GIT_DATE=${{ steps.stamp.outputs.date }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
