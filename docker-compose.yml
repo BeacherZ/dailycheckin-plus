@@ -1,0 +1,27 @@
+services:
+  dailycheckin-plus:
+    image: ghcr.io/beacherz/dailycheckin-plus:latest
+    container_name: dailycheckin-plus
+    restart: unless-stopped
+    ports:
+      # 冒号左边是宿主机端口（8181），被别的服务占了就改成别的（之后用 http://你的IP:端口 打开）；
+      # 右边是容器内端口，不要单独改它。
+      - 8181:8080
+    volumes:
+      - ./config:/dailycheckin-plus/config
+      - ./logs:/dailycheckin-plus/logs
+      - ./data:/dailycheckin-plus/data
+      - ./cron:/dailycheckin-plus/cron
+    environment:
+      - TZ=Asia/Shanghai
+      # - PANEL_PORT=8080                 # 容器内监听端口，改这里要同步改上面的映射
+      # - PANEL_TITLE=签到管理面板
+      # - PANEL_USERNAME=admin            # 想跳过「首次打开手动设置」，就用这两个直接建号
+      # - PANEL_PASSWORD=改成你自己的密码
+      # - PANEL_TOKEN=                    # 可选脚本口令，给 curl / 自动化用，不能替代登录
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,urllib.request;urllib.request.urlopen('http://127.0.0.1:'+os.environ.get('PANEL_PORT','8080')+'/api/health',timeout=5)"]
+      interval: 30s
+      timeout: 6s
+      start_period: 15s
+      retries: 3

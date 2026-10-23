@@ -1,0 +1,25 @@
+# 从源码构建版（不走 ghcr.io 镜像）。
+# 用法：docker compose -f docker-compose.build.yml up -d --build
+services:
+  dailycheckin-plus:
+    build: .
+    image: dailycheckin-plus:latest
+    container_name: dailycheckin-plus
+    restart: unless-stopped
+    ports:
+      # 冒号左边是宿主机端口（8181），被别的服务占了就改成别的（之后用 http://你的IP:端口 打开）；
+      # 右边是容器内端口，不要单独改它。
+      - 8181:8080
+    volumes:
+      - ./config:/dailycheckin-plus/config
+      - ./logs:/dailycheckin-plus/logs
+      - ./data:/dailycheckin-plus/data
+      - ./cron:/dailycheckin-plus/cron
+    environment:
+      - TZ=Asia/Shanghai
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,urllib.request;urllib.request.urlopen('http://127.0.0.1:'+os.environ.get('PANEL_PORT','8080')+'/api/health',timeout=5)"]
+      interval: 30s
+      timeout: 6s
+      start_period: 15s
+      retries: 3
