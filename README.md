@@ -85,8 +85,9 @@ docker rm -f dailycheckin-plus
 Windows 下挂载路径写成 `-v D:/docker/dailycheckin-plus/config:/dailycheckin-plus/config` 这样的形式。
 
 ### 数据放在哪
+配置目录 `/opt/docker/dailycheckin-plus`
 
-| 目录 | 内容 |
+| 子目录 | 内容 |
 |---|---|
 | `config/` | `config.json`，站点与 cookie（与上游格式一致） |
 | `cron/` | 定时任务 |
